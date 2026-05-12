@@ -49,8 +49,8 @@ def read_info_label(label_path):
     }
 
 
-def load_gt_txt(gt_txt_path):
-    frame_dict = defaultdict(list)
+def read_gt_txt(gt_txt_path):
+    gt_by_os2_idx= defaultdict(list)
 
     with open(gt_txt_path, "r") as f:
         lines = [line.strip() for line in f.readlines() if line.strip()]
@@ -65,8 +65,10 @@ def load_gt_txt(gt_txt_path):
             raise ValueError(f"Expected 10 values in gt line, got {len(parts)}: {line}")
 
         gt_frame_idx = int(parts[0])
-        frame_idx = gt_frame_idx - 1
+        os2_64_idx = gt_frame_idx
+
         object_label = int(parts[1])
+
         a_idx = float(parts[2])
         r_idx = float(parts[3])
         a_width = float(parts[4])
@@ -74,6 +76,7 @@ def load_gt_txt(gt_txt_path):
         e_idx = float(parts[6])
         e_width = float(parts[7])
         yaw = float(parts[8])
+        yaw_rad = yaw * np.pi / 180.0
         cls = parts[9]
 
         box_rae = torch.tensor(
@@ -84,70 +87,28 @@ def load_gt_txt(gt_txt_path):
                 r_width,
                 a_width,
                 e_width,
-                yaw
-            ],
-            dtype=torch.float32
-        )
-
-        box_aer = torch.tensor(
-            [
-                a_idx,
-                e_idx,
-                r_idx,
-                a_width,
-                e_width,
-                r_width,
-                yaw
+                yaw_rad
             ],
             dtype=torch.float32
         )
 
         obj = {
-            "gt_frame_idx": gt_frame_idx,
-            "frame_idx": frame_idx,
-            "object_label": object_label,
-            "a_idx": a_idx,
-            "r_idx": r_idx,
-            "a_width": a_width,
-            "r_width": r_width,
-            "e_idx": e_idx,
-            "e_width": e_width,
-            "yaw": yaw,
+            "gt_frame_idx": gt_frame_idx, 
+            "os2_64_idx":os2_64_idx,
+            "object_label":object_label,
             "cls": cls,
             "class_id": object_label,
-            "object": [
-                a_idx,
-                e_idx,
-                r_idx,
-                a_width,
-                e_width,
-                r_width,
-                yaw,
-                object_label
-            ],
-            "box_aer": box_aer,
-            "box_rae": box_rae
+            "box_rae": box_rae,
+            "raw": {
+                "a_idx":a_idx,
+                "r_idx": r_idx,
+                "a_width": a_width,
+                "r_width": r_width,
+                "e_idx": e_idx,
+                "e_width": e_width,
+                "yaw": yaw,
+                "yaw_rad": yaw_rad,
+            }
         }
-
-        frame_dict[frame_idx].append(obj)
-
-    gt_infos = []
-
-    for frame_idx in sorted(frame_dict.keys()):
-        gt_infos.append({
-            "frame_idx": frame_idx,
-            "gt_frame_idx": frame_idx + 1,
-            "objects": frame_dict[frame_idx]
-        })
-
-    return gt_infos
-
-
-def read_gt_txt(gt_txt_path):
-    gt_infos = load_gt_txt(gt_txt_path)
-
-    gt_by_os2_idx = {}
-    for info in gt_infos:
-        gt_by_os2_idx[info["gt_frame_idx"]] = info["objects"]
-
+        gt_by_os2_idx[os2_64_idx].append(obj)
     return gt_by_os2_idx

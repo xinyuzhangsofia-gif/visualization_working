@@ -6,7 +6,7 @@ class DataConfig:
     lidar2radar_calib_path: str = "/home/local/xinyu/MVRSS/mvrss/lidar2radar_calib.yml"
 
     start_frame_idx: int = 0
-    sequence: int = 1
+    sequence: int = 11
     step: int = 1
     fps: int = 10
     show_texts: bool = True

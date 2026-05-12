@@ -1,110 +1,47 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-from zxy_label_utils import read_info_label, read_gt_txt
-from zxy_data_path import get_label_files
-
-class DummyDataset(Dataset):
-    def __init__(
-            self,
-            length=100,
-            rad_size=(256, 107, 64),
-            rae_size=(256, 107, 37), 
-            det_gt_size=(256, 107, 37),
-            max_objects=8,
-            num_classes=10,
-            box_dim=7
-            ):
-         super().__init__()
-         self.length=length
-         self.rad_size=rad_size
-         self.rae_size=rae_size
-         self.det_gt_size=det_gt_size
-         self.max_objects=max_objects
-         self.num_classes=num_classes
-         self.box_dim=box_dim
-
-    def __len__(self):
-        return self.length
-
-    def __getitem__(self, index):
-        num_objects = torch.randint(0, self.max_objects + 1, (1,)).item()
-
-        return {
-             'rad':torch.randn(*self.rad_size),
-             'rae':torch.randn(*self.rae_size),
-             'det_gt':torch.randn(*self.det_gt_size),
-             'gt_boxes':torch.randn(num_objects, self.box_dim),
-             'gt_labels':torch.randint(0, self.num_classes, (num_objects,), dtype=torch.long),
-        }
+from torch.utils.data import DataLoader,random_split
+from zxy_config import DataConfig
+from zxy_data_path import get_gt_txt_path, get_label_dir, get_label_files
+from kradar_dataset import (
+    KRadarGTDetectionDataset,
+    KRadarRADRAEDataset,
+    detection_collate,
+)
+from tqdm import tqdm
 
 
-def dummy_detection_collate(batch):
-    collated = {
-        'rad': torch.stack([item['rad'] for item in batch], dim=0),
-        'rae': torch.stack([item['rae'] for item in batch], dim=0),
-        'gt_boxes': [item['gt_boxes'] for item in batch],
-        'gt_labels': [item['gt_labels'] for item in batch],
-    }
+def print_training_history(history):
+    if len(history) == 0:
+        return
 
-    if 'det_gt' in batch[0]:
-        collated['det_gt'] = torch.stack([item['det_gt'] for item in batch], dim=0)
+    print("\nTraining history")
+    print(
+        f"{'epoch':>5} "
+        f"{'train_loss':>11} "
+        f"{'box':>9} "
+        f"{'cls':>9} "
+        f"{'val_precision':>14} "
+        f"{'val_recall':>11} "
+        f"{'TP':>6} "
+        f"{'FP':>6} "
+        f"{'FN':>6}"
+    )
+    print("-" * 86)
 
-    return collated
-
-
-class KRadarGTDetectionDataset(Dataset):
-    def __init__(
-            self,
-            label_dir,
-            radar_dataset,
-            gt_txt_path,
-            label_files=None
-            ):
-        super().__init__()
-        self.label_dir = label_dir
-        self.label_files = label_files
-        if self.label_files is None:
-            self.label_files = get_label_files(label_dir)
-
-        self.radar_dataset = radar_dataset
-        self.gt_by_os2_idx = read_gt_txt(gt_txt_path)
-
-    def __len__(self):
-        return len(self.label_files)
-
-    def __getitem__(self, index):
-        label_path = f"{self.label_dir}/{self.label_files[index]}"
-        info_label = read_info_label(label_path)
-
-        os2_64_idx = int(info_label["os2_64_idx"])
-        objects = self.gt_by_os2_idx.get(os2_64_idx, [])
-
-        radar_data = self.radar_dataset.get_by_tesseract_idx(
-            info_label["tesseract_idx"]
+    for row in history:
+        print(
+            f"{row['epoch']:5d} "
+            f"{row['train_loss']:11.4f} "
+            f"{row['box']:9.4f} "
+            f"{row['cls']:9.4f} "
+            f"{row['val_precision']:14.4f} "
+            f"{row['val_recall']:11.4f} "
+            f"{row['tp']:6d} "
+            f"{row['fp']:6d} "
+            f"{row['fn']:6d}"
         )
-
-        rad = torch.from_numpy(radar_data["rad"]).float()
-        rae = torch.from_numpy(radar_data["rea"]).float()
-
-        if len(objects) > 0:
-            gt_boxes = torch.stack([obj["box_aer"] for obj in objects], dim=0)
-            gt_labels = torch.tensor(
-                [obj["object_label"] for obj in objects],
-                dtype=torch.long
-            )
-        else:
-            gt_boxes = torch.zeros((0, 7), dtype=torch.float32)
-            gt_labels = torch.zeros((0,), dtype=torch.long)
-
-        return {
-            "rad": rad,
-            "rae": rae,
-            "gt_boxes": gt_boxes,
-            "gt_labels": gt_labels,
-        }
-
 
 
 class RadarConvBlock(nn.Module):
@@ -264,7 +201,8 @@ def detection_loss(
         gt_labels_list,
         num_classes,
         box_loss_weight=1.0,
-        cls_loss_weight=1.0
+        cls_loss_weight=1.0,
+        background_weight=0.1
     ):
     device = outputs.device
 
@@ -277,7 +215,7 @@ def detection_loss(
             f"Expected output dim {expected_output_dim}, got {outputs.shape[-1]}"
         )
 
-    pred_boxes = outputs[:, :, :box_dim]
+    pred_boxes = outputs[:, :, :box_dim].sigmoid()
     pred_logits = outputs[:, :, box_dim:]
 
     target_boxes, target_classes, positive_mask = build_padded_targets(
@@ -289,9 +227,13 @@ def detection_loss(
         device=device
     )
 
+    class_weights = torch.ones(num_classes + 1, device=device)
+    class_weights[-1] = background_weight
+
     cls_loss = F.cross_entropy(
         pred_logits.reshape(-1, num_classes + 1),
-        target_classes.reshape(-1)
+        target_classes.reshape(-1),
+        weight=class_weights
     )
 
     if positive_mask.any():
@@ -315,72 +257,348 @@ def detection_loss(
 
     return total_loss, loss_dict
 
+def boxes_rae_to_ra_xyxy(boxes):
+    """
+    boxes: [N, 7]
+    box:
+    [r_idx, a_idx, e_idx, r_width, a_width, e_width, yaw]
+
+    return:
+    [N, 4]
+    [r_min, a_min, r_max, a_max]
+    """
+    r = boxes[:, 0]
+    a = boxes[:, 1]
+    r_w = boxes[:, 3]
+    a_w = boxes[:, 4]
+
+    r_min = r - r_w / 2.0
+    r_max = r + r_w / 2.0
+    a_min = a - a_w / 2.0
+    a_max = a + a_w / 2.0
+
+    return torch.stack([r_min, a_min, r_max, a_max], dim=-1)
 
 
-if __name__ == "__main__":
-    numClasses = 10
+def box_iou_2d(boxes1, boxes2):
+    """
+    boxes1: [N, 4]
+    boxes2: [M, 4]
+     [r_min, a_min, r_max, a_max]
+    """
+    if boxes1.numel() == 0 or boxes2.numel() == 0:
+        return torch.zeros(
+            (boxes1.shape[0], boxes2.shape[0]),
+            device=boxes1.device
+        )
 
-    BatchSize = 4
-    rad_input_size = (256, 107, 64)
-    rae_input_size = (256, 107, 37)
-    feature_size = (128, 24, 64)
+    left_top = torch.max(boxes1[:, None, :2], boxes2[None, :, :2])
+    right_bottom = torch.min(boxes1[:, None, 2:], boxes2[None, :, 2:])
 
-    num_boxes = 64
-    det_gt_size = (num_boxes, 7+numClasses+1)
-    
-    #dataset = KRadarDataset("/home/local/xinyu/KRadar/1/radar_tesseract")
-    dataset = DummyDataset(length=100,rad_size=rad_input_size, rae_size=rae_input_size,
-                           det_gt_size=det_gt_size, num_classes=numClasses)
-    
-    dataloader = DataLoader(
-        dataset,
-        batch_size=BatchSize,
-        shuffle=True,
-        collate_fn=dummy_detection_collate
+    wh = (right_bottom - left_top).clamp(min=0)
+    inter = wh[:, :, 0] * wh[:, :, 1]
+
+    area1 = (
+        (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0)
+        * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0)
     )
 
-    model = MVRSS3DModel(
-        rad_input_size=rad_input_size, 
-        rae_input_size=rae_input_size,
-        feature_size=feature_size,
-        det_gt_size=det_gt_size
-        ).to('cuda')
-    
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    model.train()
+    area2 = (
+        (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0)
+        * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0)
+    )
 
-    
-    for i,batch in enumerate(dataloader):
-        batch['rad'] = batch['rad'].to('cuda')
-        batch['rae'] = batch['rae'].to('cuda')
-        batch['det_gt'] = batch['det_gt'].to('cuda')
+    union = area1[:, None] + area2[None, :] - inter + 1e-6
 
-        print(batch['rad'].shape)
-        print(batch['rae'].shape)
-        print(batch['det_gt'].shape)
+    return inter / union
+
+@torch.no_grad()
+def evaluate_precision_recall(
+        model,
+        dataloader,
+        device,
+        num_classes,
+        score_thresh=0.5,
+        iou_thresh=0.5
+    ):
+    model.eval()
+
+    total_tp = 0
+    total_fp = 0
+    total_fn = 0
+
+    for batch in dataloader:
+        batch["rad"] = batch["rad"].to(device)
+        batch["rae"] = batch["rae"].to(device)
 
         outputs = model(batch)
-        assert outputs.shape == batch['det_gt'].shape, f"Output shape {outputs.shape} does not match target shape {batch['det_gt'].shape}"
-        if outputs.shape != batch['det_gt'].shape:
-            raise ValueError(f"Output shape {outputs.shape} does not match target shape {batch['det_gt'].shape}")
+
+        pred_boxes = outputs[:, :, :7].sigmoid()
+        pred_logits = outputs[:, :, 7:]
+
+        pred_probs = pred_logits.softmax(dim=-1)
+
+        pred_scores, pred_labels = pred_probs[:, :, :num_classes].max(dim=-1)
+
+        batch_size = pred_boxes.shape[0]
+
+        for b in range(batch_size):
+            scores_b = pred_scores[b]
+            labels_b = pred_labels[b]
+            boxes_b = pred_boxes[b]
+
+            # 
+            keep = scores_b > score_thresh
+
+            pred_boxes_keep = boxes_b[keep]
+            pred_labels_keep = labels_b[keep]
+            pred_scores_keep = scores_b[keep]
+
+            gt_boxes = batch["gt_boxes"][b].to(device)
+            gt_labels = batch["gt_labels"][b].to(device)
+
+            # 1
+            if pred_boxes_keep.shape[0] == 0:
+                total_fn += gt_boxes.shape[0]
+                continue
+
+            # 2
+            if gt_boxes.shape[0] == 0:
+                total_fp += pred_boxes_keep.shape[0]
+                continue
+
+            pred_ra_boxes = boxes_rae_to_ra_xyxy(pred_boxes_keep)
+            gt_ra_boxes = boxes_rae_to_ra_xyxy(gt_boxes)
+
+            ious = box_iou_2d(pred_ra_boxes, gt_ra_boxes)
+
+            matched_gt = set()
+
+            # 
+            order = pred_scores_keep.argsort(descending=True)
+
+            for pred_idx_tensor in order:
+                pred_idx = pred_idx_tensor.item()
+
+                iou_row = ious[pred_idx]
+                best_iou, best_gt_idx_tensor = iou_row.max(dim=0)
+                best_gt_idx = best_gt_idx_tensor.item()
+
+                class_correct = (
+                    pred_labels_keep[pred_idx].item()
+                    == gt_labels[best_gt_idx].item()
+                )
+
+                if (
+                    best_iou.item() >= iou_thresh
+                    and class_correct
+                    and best_gt_idx not in matched_gt
+                ):
+                    total_tp += 1
+                    matched_gt.add(best_gt_idx)
+                else:
+                    total_fp += 1
+
+            total_fn += gt_boxes.shape[0] - len(matched_gt)
+
+    precision = total_tp / (total_tp + total_fp + 1e-6)
+    recall = total_tp / (total_tp + total_fn + 1e-6)
+
+    model.train()
+
+    return {
+        "precision": precision,
+        "recall": recall,
+        "tp": total_tp,
+        "fp": total_fp,
+        "fn": total_fn,
+    }
+
+def train_one_epoch(
+        model,
+        dataloader,
+        optimizer,
+        device,
+        num_classes,
+        epoch=None,
+        num_epochs=None,
+        box_loss_weight=1.0,
+        cls_loss_weight=1.0,
+        background_weight=0.1
+    ):
+    model.train()
+
+    total_loss_sum = 0.0
+    box_loss_sum = 0.0
+    cls_loss_sum = 0.0
+    num_batches = 0
+
+    if epoch is not None and num_epochs is not None:
+        desc = f"Epoch {epoch + 1}/{num_epochs}"
+    else:
+        desc = "Training"
+
+    pbar = tqdm(dataloader, desc=desc, ncols=120)
+
+    for batch in pbar:
+        batch["rad"] = batch["rad"].to(device)
+        batch["rae"] = batch["rae"].to(device)
+
+        outputs = model(batch)
 
         loss, loss_dict = detection_loss(
             outputs=outputs,
-            gt_boxes_list=batch['gt_boxes'],
-            gt_labels_list=batch['gt_labels'],
-            num_classes=numClasses,
-            box_loss_weight=1.0,
-            cls_loss_weight=1.0
+            gt_boxes_list=batch["gt_boxes"],
+            gt_labels_list=batch["gt_labels"],
+            num_classes=num_classes,
+            box_loss_weight=box_loss_weight,
+            cls_loss_weight=cls_loss_weight,
+            background_weight=background_weight
         )
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        print(
-            f"iter={i}, "
-            f"loss={loss_dict['total_loss']:.4f}, "
-            f"box={loss_dict['box_loss']:.4f}, "
-            f"cls={loss_dict['cls_loss']:.4f}"
+        total_loss_sum += loss_dict["total_loss"]
+        box_loss_sum += loss_dict["box_loss"]
+        cls_loss_sum += loss_dict["cls_loss"]
+        num_batches += 1
+
+        avg_loss = total_loss_sum / num_batches
+        avg_box = box_loss_sum / num_batches
+        avg_cls = cls_loss_sum / num_batches
+
+        pbar.set_postfix({
+            "loss": f"{avg_loss:.4f}",
+            "box": f"{avg_box:.4f}",
+            "cls": f"{avg_cls:.4f}",
+        })
+
+    avg_total_loss = total_loss_sum / max(num_batches, 1)
+    avg_box_loss = box_loss_sum / max(num_batches, 1)
+    avg_cls_loss = cls_loss_sum / max(num_batches, 1)
+
+    return {
+        "train_loss": avg_total_loss,
+        "train_box_loss": avg_box_loss,
+        "train_cls_loss": avg_cls_loss,
+    }
+
+if __name__ == "__main__":
+    cfg = DataConfig()
+    numClasses = 2
+
+    BatchSize = 8
+    num_epochs = 10
+
+    rad_input_size = (256, 107, 64)
+    rae_input_size = (256, 107, 37)
+    feature_size = (128, 24, 64)
+
+    num_boxes = 64
+    det_gt_size = (num_boxes, 7 + numClasses + 1)
+
+    radar_dataset = KRadarRADRAEDataset(
+        "/run/user/1000/gvfs/smb-share:server=192.168.189.30,share=elab-share/Datasets/K-Radar-RAD",
+        cfg.sequence
+    )
+
+    full_dataset = KRadarGTDetectionDataset(
+        label_dir=get_label_dir(cfg),
+        radar_dataset=radar_dataset,
+        gt_txt_path=get_gt_txt_path(cfg)
+    )
+
+    train_ratio = 0.8
+    train_size = int(len(full_dataset) * train_ratio)
+    val_size = len(full_dataset) - train_size
+
+    generator = torch.Generator().manual_seed(42)
+
+    train_dataset, val_dataset = random_split(
+        full_dataset,
+        [train_size, val_size],
+        generator=generator
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BatchSize,
+        shuffle=True,
+        collate_fn=detection_collate,
+        num_workers=0
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BatchSize,
+        shuffle=False,
+        collate_fn=detection_collate,
+        num_workers=0
+    )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("device:", device)
+    print("full dataset size:", len(full_dataset))
+    print("train size:", len(train_dataset))
+    print("val size:", len(val_dataset))
+
+    model = MVRSS3DModel(
+        rad_input_size=rad_input_size,
+        rae_input_size=rae_input_size,
+        feature_size=feature_size,
+        det_gt_size=det_gt_size
+    ).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    history = []
+
+    for epoch in range(num_epochs):
+        train_metrics = train_one_epoch(
+            model=model,
+            dataloader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            num_classes=numClasses,
+            epoch=epoch,
+            num_epochs=num_epochs,
+            box_loss_weight=1.0,
+            cls_loss_weight=1.0,
+            background_weight=0.2
         )
-        break
+
+        val_metrics = evaluate_precision_recall(
+            model=model,
+            dataloader=val_loader,
+            device=device,
+            num_classes=numClasses,
+            score_thresh=0.1,
+            iou_thresh=0.1
+        )
+
+        print(
+            f"Epoch [{epoch + 1}/{num_epochs}] "
+            f"train_loss={train_metrics['train_loss']:.4f}, "
+            f"box={train_metrics['train_box_loss']:.4f}, "
+            f"cls={train_metrics['train_cls_loss']:.4f}, "
+            f"val_precision={val_metrics['precision']:.4f}, "
+            f"val_recall={val_metrics['recall']:.4f}, "
+            f"TP={val_metrics['tp']}, "
+            f"FP={val_metrics['fp']}, "
+            f"FN={val_metrics['fn']}"
+        )
+
+        history.append({
+            "epoch": epoch + 1,
+            "train_loss": train_metrics["train_loss"],
+            "box": train_metrics["train_box_loss"],
+            "cls": train_metrics["train_cls_loss"],
+            "val_precision": val_metrics["precision"],
+            "val_recall": val_metrics["recall"],
+            "tp": val_metrics["tp"],
+            "fp": val_metrics["fp"],
+            "fn": val_metrics["fn"],
+        })
+
+    print_training_history(history)
