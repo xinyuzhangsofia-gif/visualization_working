@@ -1,0 +1,5 @@
+checkpoints/
+runs/
+__pycache__/
+.pyc
+ra_vis/
