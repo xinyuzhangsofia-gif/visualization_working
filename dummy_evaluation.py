@@ -4,7 +4,25 @@ import re
 import torch
 from dummy_dataloader import build_train_val_dataloaders, prepare_model_inputs
 from dummy_visualize import build_model, load_checkpoint, select_device
+from tqdm import tqdm
 from zxy_config import DataConfig
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate dummy MVRSS checkpoints.")
+    parser.add_argument("--checkpoint-root", default="")
+    parser.add_argument("--epoch-step", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--train-ratio", type=float, default=0.7)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--limit-samples", type=int, default=None)
+    parser.add_argument("--score-thresh", type=float, default=0.2)
+    parser.add_argument("--eval-iou-thresh", type=float, default=0.1)
+    parser.add_argument("--num-boxes", type=int, default=64)
+    parser.add_argument("--num-classes", type=int, default=6)
+    return parser.parse_args()
+
 
 def boxes_3d_to_ra_xyxy(boxes):
 
@@ -39,12 +57,10 @@ def box_iou_2d(boxes1, boxes2):
         (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0)
         * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0)
     )
-
     area2 = (
         (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0)
         * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0)
     )
-
     union = area1[:, None] + area2[None, :] - inter + 1e-6
 
     return inter / union
@@ -159,7 +175,7 @@ def evaluate_precision_recall(
     gt_by_class = {class_id: {} for class_id in range(num_classes)}
     image_counter = 0
 
-    for batch in dataloader:
+    for batch in tqdm(dataloader, desc="Evaluation", ncols=120, leave=False):
         rad, rae = prepare_model_inputs(batch, device)
         outputs = model(rad, rae)
 
@@ -417,28 +433,11 @@ def print_results_table(results):
     print("="*110 + "\n")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate dummy MVRSS checkpoints.")
-    parser.add_argument("--checkpoint-root", default="")
-    parser.add_argument("--epoch-step", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--train-ratio", type=float, default=0.7)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--limit-samples", type=int, default=None)
-    parser.add_argument("--score-thresh", type=float, default=0.2)
-    parser.add_argument("--eval-iou-thresh", type=float, default=0.1)
-    parser.add_argument("--num-boxes", type=int, default=64)
-    parser.add_argument("--num-classes", type=int, default=6)
-    return parser.parse_args()
-
-
 def main():
 
 
     args = parse_args()
-    checkpoint_root = "/home/local/xinyu/MVRSS/mvrss/checkpoints/mvrss_detection/seq11_20260520_102529_495220"
-    # checkpoint_root = "/home/local/xinyu/MVRSS/mvrss/checkpoints/mvrss_detection/seq11_20260520_001311_361632"
+    checkpoint_root = "/home/local/xinyu/MVRSS/mvrss/checkpoints/mvrss_detection/seq11_20260520_105936_148715"
     if args.checkpoint_root:
         checkpoint_root = args.checkpoint_root
 
@@ -456,11 +455,7 @@ def main():
     if len(validation_dataset) == 0:
         raise ValueError("Validation split is empty. Adjust --train-ratio or --limit-samples.")
 
-    model = build_model(
-        device=device,
-        num_boxes=args.num_boxes,
-        num_classes=args.num_classes
-    )
+    model = build_model(device=device,num_boxes=args.num_boxes,num_classes=args.num_classes)
 
     def evaluate_checkpoint(checkpoint_path):
         load_checkpoint(
@@ -486,7 +481,7 @@ def main():
 
     results = []
     print(f"Evaluating {len(checkpoint_paths)} checkpoints from {checkpoint_root}")
-    for epoch, checkpoint_path in checkpoint_paths:
+    for epoch, checkpoint_path in tqdm(checkpoint_paths, desc="Checkpoints", ncols=120):
         metrics = evaluate_checkpoint(checkpoint_path)
         graph_metrics = metrics_for_graph(metrics)
         graph_metrics["epoch"] = epoch
@@ -494,7 +489,6 @@ def main():
         print_evaluation_result(epoch, graph_metrics)
 
     print_results_table(results)
-
 
 if __name__ == "__main__":
     main()

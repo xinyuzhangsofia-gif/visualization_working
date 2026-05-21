@@ -40,7 +40,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_model(device, num_boxes=64, num_classes=6):
+def build_model(device, num_boxes=64, num_classes=NUM_CLASSES):
     model = MVRSS3DModel(
         d_in=64,
         e_in=37,
@@ -56,7 +56,7 @@ def build_model(device, num_boxes=64, num_classes=6):
 
 def load_checkpoint(model, checkpoint_path, device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+    if "model_state_dict" in checkpoint:
         model.load_state_dict(checkpoint["model_state_dict"])
     else:
         model.load_state_dict(checkpoint)
