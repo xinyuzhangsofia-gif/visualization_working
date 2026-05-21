@@ -1,191 +1,15 @@
 import argparse
-import random
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-from dummy_dataloader import (
-    build_train_val_dataloaders,
-    get_config_sequences,
-    prepare_model_inputs,
-)
+from dummy_dataloader import (build_train_val_dataloaders,get_config_sequences,prepare_model_inputs)
 from dummy_evaluation import *
 from dummy_module import MVRSS3DModel
-from utils_dummy.checkpoints import (
-    create_checkpoint_run_dir,
-    create_checkpoint_run_dirs,
-    save_best_checkpoint_copy,
-    save_epoch_checkpoint,
-    save_named_checkpoint_copy,
-)
-from utils_dummy.logging_utils import (
-    create_tensorboard_writer,
-    print_training_history,
-    write_tensorboard_metrics,
-    write_tensorboard_run_config,
-)
+from utils_dummy.checkpoints import *
+from utils_dummy.logging_utils import *
+from utils_dummy.other_helping_dunctions import *
 from zxy_config import DataConfig
-
-def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-def greedy_iou_match(pred_boxes, gt_boxes, iou_thresh=0.0):
-    """
-    pred_boxes: [num_queries, 7]
-    gt_boxes:   [num_gt, 7]
-
-    return:
-        matched_pred_indices: LongTensor [num_matched]
-        matched_gt_indices:   LongTensor [num_matched]
-    """
-
-    device = pred_boxes.device
-
-    if pred_boxes.shape[0] == 0 or gt_boxes.shape[0] == 0:
-        return (
-            torch.empty(0, dtype=torch.long, device=device),
-            torch.empty(0, dtype=torch.long, device=device)
-        )
-
-    pred_ra_boxes = boxes_rae_to_ra_xyxy(pred_boxes)
-    gt_ra_boxes = boxes_rae_to_ra_xyxy(gt_boxes)
-
-    ious = box_iou_2d(pred_ra_boxes, gt_ra_boxes)
-    flat_ious = ious.reshape(-1)
-    order = flat_ious.argsort(descending=True)
-
-    matched_pred = []
-    matched_gt = []
-
-    used_pred = set()
-    used_gt = set()
-
-    num_gt = gt_boxes.shape[0]
-
-    for flat_idx in order:
-        flat_idx = flat_idx.item()
-
-        pred_idx = flat_idx // num_gt
-        gt_idx = flat_idx % num_gt
-
-        iou_value = ious[pred_idx, gt_idx].item()
-
-        if iou_value < iou_thresh:
-            break
-
-        if pred_idx in used_pred:
-            continue
-
-        if gt_idx in used_gt:
-            continue
-
-        matched_pred.append(pred_idx)
-        matched_gt.append(gt_idx)
-
-        used_pred.add(pred_idx)
-        used_gt.add(gt_idx)
-
-        if len(used_gt) == num_gt:
-            break
-
-    matched_pred_indices = torch.tensor(
-        matched_pred,
-        dtype=torch.long,
-        device=device
-    )
-
-    matched_gt_indices = torch.tensor(
-        matched_gt,
-        dtype=torch.long,
-        device=device
-    )
-
-    return matched_pred_indices, matched_gt_indices
-
-
-@torch.no_grad()
-def greedy_cost_match(
-        pred_boxes,
-        gt_boxes,
-        cost_bbox=1.0,
-        cost_iou=1.0
-    ):
-    device = pred_boxes.device
-
-    if pred_boxes.shape[0] == 0 or gt_boxes.shape[0] == 0:
-        return (
-            torch.empty(0, dtype=torch.long, device=device),
-            torch.empty(0, dtype=torch.long, device=device)
-        )
-
-    bbox_cost = torch.cdist(
-        pred_boxes[:, :6],
-        gt_boxes[:, :6],
-        p=1
-    )
-
-    pred_ra_boxes = boxes_rae_to_ra_xyxy(pred_boxes)
-    gt_ra_boxes = boxes_rae_to_ra_xyxy(gt_boxes)
-
-    ious = box_iou_2d(pred_ra_boxes, gt_ra_boxes)
-    iou_cost = 1.0 - ious
-
-    total_cost = cost_bbox * bbox_cost + cost_iou * iou_cost
-
-    flat_cost = total_cost.reshape(-1)
-    order = flat_cost.argsort(descending=False)
-
-    matched_pred = []
-    matched_gt = []
-
-    used_pred = set()
-    used_gt = set()
-
-    num_gt = gt_boxes.shape[0]
-
-    for flat_idx in order:
-        flat_idx = flat_idx.item()
-
-        pred_idx = flat_idx // num_gt
-        gt_idx = flat_idx % num_gt
-
-        if pred_idx in used_pred:
-            continue
-
-        if gt_idx in used_gt:
-            continue
-
-        matched_pred.append(pred_idx)
-        matched_gt.append(gt_idx)
-
-        used_pred.add(pred_idx)
-        used_gt.add(gt_idx)
-
-        if len(used_gt) == num_gt:
-            break
-
-    matched_pred_indices = torch.tensor(
-        matched_pred,
-        dtype=torch.long,
-        device=device
-    )
-
-    matched_gt_indices = torch.tensor(
-        matched_gt,
-        dtype=torch.long,
-        device=device
-    )
-
-    return matched_pred_indices, matched_gt_indices
 
 @torch.no_grad()
 def hungarian_cost_match(
@@ -208,8 +32,8 @@ def hungarian_cost_match(
         p=1
     )
 
-    pred_ra_boxes = boxes_rae_to_ra_xyxy(pred_boxes)
-    gt_ra_boxes = boxes_rae_to_ra_xyxy(gt_boxes)
+    pred_ra_boxes = boxes_3d_to_ra_xyxy(pred_boxes)
+    gt_ra_boxes = boxes_3d_to_ra_xyxy(gt_boxes)
 
     ious = box_iou_2d(pred_ra_boxes, gt_ra_boxes)
     iou_cost = 1.0 - ious
@@ -232,7 +56,6 @@ def hungarian_cost_match(
         dtype=torch.long,
         device=device
     )
-
     return matched_pred_indices, matched_gt_indices
 
 def detection_loss(
@@ -282,12 +105,6 @@ def detection_loss(
 
         pred_boxes_b = pred_boxes[b]
 
-        # matched_pred_indices, matched_gt_indices = greedy_cost_match(
-        #     pred_boxes=pred_boxes_b,
-        #     gt_boxes=gt_boxes,
-        #     cost_bbox=1.0,
-        #     cost_iou=1.0
-        # )
         matched_pred_indices, matched_gt_indices = hungarian_cost_match(
             pred_boxes=pred_boxes_b,
             gt_boxes=gt_boxes,
@@ -352,10 +169,7 @@ def train_one_epoch(
         num_epochs=None,
         box_loss_weight=1.0,
         cls_loss_weight=1.0,
-        background_weight=0.1,
-        writer=None,
-        global_step=0,
-        log_interval=1
+        background_weight=0.1
     ):
     model.train()
 
@@ -393,7 +207,6 @@ def train_one_epoch(
         box_loss_sum += loss_dict["box_loss"]
         cls_loss_sum += loss_dict["cls_loss"]
         num_batches += 1
-        global_step += 1
 
         avg_loss = total_loss_sum / num_batches
         avg_box = box_loss_sum / num_batches
@@ -413,7 +226,6 @@ def train_one_epoch(
         "train_loss": avg_total_loss,
         "train_box_loss": avg_box_loss,
         "train_cls_loss": avg_cls_loss,
-        "global_step": global_step,
     }
 
 
@@ -459,16 +271,7 @@ def validate_loss(
         "val_cls_loss": cls_loss_sum / max(num_batches, 1),
     }
 
-
-def default_val_loss_metrics():
-    return {
-        "val_loss": 0.0,
-        "val_box_loss": 0.0,
-        "val_cls_loss": 0.0,
-    }
-
-def main():
-
+def argparse_args():
     parser = argparse.ArgumentParser(description="Train the dummy MVRSS detection module.")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -482,29 +285,32 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--limit-samples", type=int, default=None)
-    parser.add_argument("--no-eval", action="store_true")
+    parser.add_argument("--best-window-size", type=int, default=5)
     parser.add_argument("--checkpoint-base-dir", default="checkpoints")
     parser.add_argument("--log-base-dir", default="runs")
     args = parser.parse_args()
+    return args
+
+
+def main():
+
+    args = argparse_args()
+    if args.best_window_size <= 0:
+        raise ValueError(f"--best-window-size must be greater than 0, got {args.best_window_size}")
 
     set_seed(args.seed)
     cfg = DataConfig()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    (
-        full_dataset,
-        train_dataset,
-        val_dataset,
-        train_loader,
-        val_loader
-    ) = build_train_val_dataloaders(
+    device = torch.device("cuda")
+    (train_dataset,val_dataset,train_loader,val_loader) = build_train_val_dataloaders(
         cfg=cfg,
         batch_size=args.batch_size,
         train_ratio=args.train_ratio,
         seed=args.seed,
         num_workers=args.num_workers,
         limit_samples=args.limit_samples
-    )
+        )
+    if len(val_dataset) == 0:
+        raise ValueError("Validation split is empty. Adjust --train-ratio or --limit-samples.")
 
     model = MVRSS3DModel(
         d_in=64,
@@ -520,52 +326,22 @@ def main():
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     history = []
-    best_map = -1.0
-    best_epoch = -1
-    best_train_metrics = None
-    best_metrics = None
-    best_f1 = 0.0
-    best_checkpoint_path = None
-    best_checkpoint_paths = None
-    best_epoch_checkpoint_path = None
-    global_best_checkpoint_path = None
-    global_best_checkpoint_paths = None
-    window_best_map = -1.0
-    window_best_epoch = -1
-    window_best_train_metrics = None
-    window_best_metrics = None
-    window_best_f1 = 0.0
-    window_best_checkpoint_path = None
-    global_step = 0
+    best_state = BestCheckpointState()
+    window_best_state = BestCheckpointState()
 
     configured_sequences = get_config_sequences(cfg)
-    primary_sequence = (
-        cfg.sequence
-        if cfg.sequence in configured_sequences
-        else configured_sequences[0]
+    checkpoint_dirs = create_checkpoint_run_dirs(
+        base_dir=args.checkpoint_base_dir,
+        experiment_name="mvrss_detection",
+        sequences=configured_sequences
     )
-    is_multi_sequence = len(configured_sequences) > 1
-    best_window_size = 100 if is_multi_sequence else 10
-    if len(configured_sequences) == 1:
-        checkpoint_key = primary_sequence
-        checkpoint_dir = create_checkpoint_run_dir(
-            base_dir=args.checkpoint_base_dir,
-            experiment_name="mvrss_detection",
-            sequence=primary_sequence
-        )
-        checkpoint_dirs = {checkpoint_key: checkpoint_dir}
-    else:
-        checkpoint_dirs = create_checkpoint_run_dirs(
-            base_dir=args.checkpoint_base_dir,
-            experiment_name="mvrss_detection",
-            sequences=configured_sequences
-        )
-        checkpoint_key = next(iter(checkpoint_dirs))
-        checkpoint_dir = checkpoint_dirs[checkpoint_key]
-    writer, log_dir = create_tensorboard_writer(
+    checkpoint_key = next(iter(checkpoint_dirs))
+    checkpoint_dir = checkpoint_dirs[checkpoint_key]
+
+    writer = create_tensorboard_writer(
         base_dir=args.log_base_dir,
         experiment_name="mvrss_detection",
-        sequence=cfg.sequence
+        sequence=configured_sequences
     )
     write_tensorboard_run_config(
         writer=writer,
@@ -579,245 +355,96 @@ def main():
         background_weight=args.background_weight,
         eval_iou_thresh=args.eval_iou_thresh
     )
-    try:
-        for epoch in range(args.epochs):
-            train_metrics = train_one_epoch(
-                model=model,
-                dataloader=train_loader,
-                optimizer=optimizer,
-                device=device,
-                num_classes=args.num_classes,
-                epoch=epoch,
-                num_epochs=args.epochs,
-                box_loss_weight=1.0,
-                cls_loss_weight=1.0,
-                background_weight=args.background_weight,
-                writer=writer,
-                global_step=global_step,
-                log_interval=1
-            )
-            global_step = train_metrics["global_step"]
-            if len(val_dataset) > 0:
-                val_loss_metrics = validate_loss(
-                    model=model,
-                    dataloader=val_loader,
-                    device=device,
-                    num_classes=args.num_classes,
-                    box_loss_weight=1.0,
-                    cls_loss_weight=1.0,
-                    background_weight=args.background_weight
-                )
-            else:
-                val_loss_metrics = default_val_loss_metrics()
-
-            if args.no_eval:
-                train_metrics["train_iou"] = 0.0
-                val_metrics = {
-                    "precision": 0.0,
-                    "recall": 0.0,
-                    "tp": 0,
-                    "fp": 0,
-                    "fn": 0,
-                    "mAP": 0.0,
-                    "ap_per_class": {
-                        class_id: 0.0
-                        for class_id in range(args.num_classes)
-                    },
-                    "val_iou": 0.0,
-                    "iou_thresh": args.eval_iou_thresh,
-                }
-                val_metrics.update(val_loss_metrics)
-                f1 = 0.0
-            elif len(val_dataset) == 0:
-                train_eval_metrics = evaluate_precision_recall(
-                    model=model,
-                    dataloader=train_loader,
-                    device=device,
-                    num_classes=args.num_classes,
-                    prepare_model_inputs=prepare_model_inputs,
-                    score_thresh=args.score_thresh,
-                    iou_thresh=args.eval_iou_thresh,
-                    max_detections=min(args.num_boxes, 20)
-                )
-                train_metrics["train_iou"] = train_eval_metrics["mean_iou"]
-                val_metrics = {
-                    "precision": 0.0,
-                    "recall": 0.0,
-                    "tp": 0,
-                    "fp": 0,
-                    "fn": 0,
-                    "mAP": 0.0,
-                    "ap_per_class": {
-                        class_id: 0.0
-                        for class_id in range(args.num_classes)
-                    },
-                    "val_iou": 0.0,
-                    "iou_thresh": args.eval_iou_thresh,
-                }
-                val_metrics.update(val_loss_metrics)
-                f1 = 0.0
-            else:
-                eval_metrics = evaluate_train_val_iou(
-                    model=model,
-                    train_dataloader=train_loader,
-                    val_dataloader=val_loader,
-                    device=device,
-                    num_classes=args.num_classes,
-                    prepare_model_inputs=prepare_model_inputs,
-                    score_thresh=args.score_thresh,
-                    iou_thresh=args.eval_iou_thresh,
-                    max_detections=min(args.num_boxes, 20)
-                )
-                train_metrics["train_iou"] = eval_metrics["train_eval_iou"]
-                val_metrics = eval_metrics["val_eval_metrics"]
-                val_metrics["val_iou"] = eval_metrics["val_eval_iou"]
-                val_metrics.update(val_loss_metrics)
-
-                precision = val_metrics["precision"]
-                recall = val_metrics["recall"]
-                f1 = 2 * precision * recall / (precision + recall + 1e-6)
-
-            learning_rate = optimizer.param_groups[0]["lr"]
-            write_tensorboard_metrics(
-                writer=writer,
-                epoch=epoch + 1,
-                train_metrics=train_metrics,
-                val_metrics=val_metrics,
-                f1=f1,
-                learning_rate=learning_rate
-            )
-
-            is_best = val_metrics["mAP"] > best_map
-            if is_best:
-                best_map = val_metrics["mAP"]
-                best_epoch = epoch + 1
-                best_train_metrics = train_metrics.copy()
-                best_metrics = val_metrics.copy()
-                best_f1 = f1
-
-            is_window_best = val_metrics["mAP"] > window_best_map
-            checkpoint_path = None
-            if is_best or is_window_best:
-                checkpoint_path = save_epoch_checkpoint(
-                    checkpoint_dir=checkpoint_dir,
-                    model=model,
-                    optimizer=optimizer,
-                    args=args,
-                    cfg=cfg,
-                    epoch=epoch + 1,
-                    global_step=global_step,
-                    train_metrics=train_metrics,
-                    val_metrics=val_metrics,
-                    f1=f1,
-                    learning_rate=learning_rate,
-                    is_best=is_best
-                )
-
-            if is_best:
-                best_epoch_checkpoint_path = checkpoint_path
-
-            if is_window_best:
-                window_best_map = val_metrics["mAP"]
-                window_best_epoch = epoch + 1
-                window_best_train_metrics = train_metrics.copy()
-                window_best_metrics = val_metrics.copy()
-                window_best_f1 = f1
-                window_best_checkpoint_path = checkpoint_path
-
-            should_save_window_best = (
-                window_best_checkpoint_path is not None
-                and ((epoch + 1) % best_window_size == 0 or (epoch + 1) == args.epochs)
-            )
-            if should_save_window_best:
-                best_checkpoint_paths = {}
-                for sequence, sequence_checkpoint_dir in checkpoint_dirs.items():
-                    best_checkpoint_paths[sequence] = save_best_checkpoint_copy(
-                        checkpoint_dir=sequence_checkpoint_dir,
-                        source_checkpoint_path=window_best_checkpoint_path,
-                        best_epoch=window_best_epoch,
-                        best_map=window_best_map
-                    )
-                best_checkpoint_path = best_checkpoint_paths[checkpoint_key]
-                print(
-                    f"Saved {best_window_size}-epoch best model: "
-                    f"epoch={window_best_epoch}, "
-                    f"train_loss={window_best_train_metrics['train_loss']:.4f}, "
-                    f"train_iou={window_best_train_metrics['train_iou']:.4f}, "
-                    f"val_iou={window_best_metrics['val_iou']:.4f}, "
-                    f"F1={window_best_f1:.4f}, "
-                    f"mAP={window_best_map:.4f}, "
-                    f"IoU={window_best_metrics['iou_thresh']:.4f}, "
-                    f"P={window_best_metrics['precision']:.4f}, "
-                    f"R={window_best_metrics['recall']:.4f}, "
-                    f"TP={window_best_metrics['tp']}, "
-                    f"FP={window_best_metrics['fp']}, "
-                    f"FN={window_best_metrics['fn']}, "
-                    f"best_paths={best_checkpoint_paths}"
-                )
-                window_best_map = -1.0
-                window_best_epoch = -1
-                window_best_train_metrics = None
-                window_best_metrics = None
-                window_best_f1 = 0.0
-                window_best_checkpoint_path = None
-
-            history.append({
-                "epoch": epoch + 1,
-                "train_loss": train_metrics["train_loss"],
-                "train_box_loss": train_metrics["train_box_loss"],
-                "train_cls_loss": train_metrics["train_cls_loss"],
-                "train_iou": train_metrics["train_iou"],
-                "val_loss": val_metrics["val_loss"],
-                "val_box_loss": val_metrics["val_box_loss"],
-                "val_cls_loss": val_metrics["val_cls_loss"],
-                "val_mAP": val_metrics["mAP"],
-                "val_precision": val_metrics["precision"],
-                "val_recall": val_metrics["recall"],
-                "val_iou": val_metrics["val_iou"],
-                "val_f1": f1,
-                "iou": val_metrics["iou_thresh"],
-                "tp": val_metrics["tp"],
-                "fp": val_metrics["fp"],
-                "fn": val_metrics["fn"],
-            })
-    finally:
-        writer.close()
-
-    print_training_history(history)
-
-    if is_multi_sequence and best_epoch_checkpoint_path is not None:
-        global_best_checkpoint_paths = {}
-        for sequence, sequence_checkpoint_dir in checkpoint_dirs.items():
-            global_best_checkpoint_paths[sequence] = save_named_checkpoint_copy(
-                checkpoint_dir=sequence_checkpoint_dir,
-                source_checkpoint_path=best_epoch_checkpoint_path,
-                best_epoch=best_epoch,
-                best_map=best_map,
-                name_prefix="global_best"
-            )
-        global_best_checkpoint_path = global_best_checkpoint_paths[checkpoint_key]
-        print(
-            f"Saved global best model: "
-            f"epoch={best_epoch}, "
-            f"mAP={best_map:.4f}, "
-            f"best_paths={global_best_checkpoint_paths}"
+    for epoch in range(args.epochs):
+        train_metrics = train_one_epoch(
+            model=model,
+            dataloader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            num_classes=args.num_classes,
+            epoch=epoch,
+            num_epochs=args.epochs,
+            box_loss_weight=1.0,
+            cls_loss_weight=1.0,
+            background_weight=args.background_weight
+        )
+        val_loss_metrics = validate_loss(
+            model=model,
+            dataloader=val_loader,
+            device=device,
+            num_classes=args.num_classes,
+            box_loss_weight=1.0,
+            cls_loss_weight=1.0,
+            background_weight=args.background_weight
+        )
+        eval_metrics = evaluate_train_val_iou(
+            model=model,
+            train_dataloader=train_loader,
+            val_dataloader=val_loader,
+            device=device,
+            num_classes=args.num_classes,
+            prepare_model_inputs=prepare_model_inputs,
+            score_thresh=args.score_thresh,
+            iou_thresh=args.eval_iou_thresh,
+            max_detections=min(args.num_boxes, 20)
+        )
+        val_metrics, f1 = build_epoch_eval_metrics(
+            train_metrics=train_metrics,
+            eval_metrics=eval_metrics,
+            val_loss_metrics=val_loss_metrics
         )
 
-    print("\nBest model summary")
-    print("global_best_epoch:", best_epoch)
-    print("global_best_mAP:", best_map)
-    print("global_best_epoch_checkpoint_path:", best_epoch_checkpoint_path)
-    print("global_best_checkpoint_path:", global_best_checkpoint_path)
-    print("global_best_checkpoint_paths:", global_best_checkpoint_paths)
-    print(f"last_saved_{best_window_size}_epoch_best_checkpoint_path:", best_checkpoint_path)
-    print(f"last_saved_{best_window_size}_epoch_best_checkpoint_paths:", best_checkpoint_paths)
-    print("checkpoint_dir:", checkpoint_dir)
-    print("checkpoint_dirs:", checkpoint_dirs)
-    print("global_best_metrics:", best_metrics)
+        learning_rate = optimizer.param_groups[0]["lr"]
+        write_tensorboard_metrics(
+            writer=writer,
+            epoch=epoch + 1,
+            train_metrics=train_metrics,
+            val_metrics=val_metrics,
+            f1=f1,
+            learning_rate=learning_rate
+        )
 
+        checkpoint_path = save_epoch_and_update_best_checkpoint(
+            best_state=best_state,
+            checkpoint_dir=checkpoint_dir,
+            model=model,
+            optimizer=optimizer,
+            args=args,
+            cfg=cfg,
+            epoch=epoch + 1,
+            train_metrics=train_metrics,
+            val_metrics=val_metrics,
+            f1=f1,
+            learning_rate=learning_rate
+        )
 
+        save_window_best_checkpoint_if_ready(
+            window_best_state=window_best_state,
+            checkpoint_dirs=checkpoint_dirs,
+            checkpoint_key=checkpoint_key,
+            checkpoint_path=checkpoint_path,
+            epoch=epoch + 1,
+            total_epochs=args.epochs,
+            train_metrics=train_metrics,
+            val_metrics=val_metrics,
+            f1=f1,
+            window_size=args.best_window_size
+        )
+        append_training_history(
+            history=history,
+            epoch=epoch + 1,
+            train_metrics=train_metrics,
+            val_metrics=val_metrics,
+            f1=f1
+        )
+    writer.close()
 
-
+    print_training_history(history)
+    save_global_best_checkpoint(
+        best_state=best_state,
+        checkpoint_dirs=checkpoint_dirs,
+        checkpoint_key=checkpoint_key
+    )
 
 if __name__ == "__main__":
     main()

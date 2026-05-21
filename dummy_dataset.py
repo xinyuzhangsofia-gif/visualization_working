@@ -284,15 +284,4 @@ class KRadarRADRAEDataset(Dataset):
             raise KeyError(f"file_idx {file_idx} not found in sequence {self.sequence}")
         return self._load_one_dataset_idx(file_idx)
 
-# if __name__ == "__main__":
-#     dataset = KRadarRADDataset(
-#         "/run/user/1000/gvfs/smb-share:server=192.168.189.30,share=elab-share/Datasets/K-Radar-RAD",
-#         1
-#     )
-#     data = dataset.get_by_tesseract_idx("00033")
 
-#     print(data["rad"].shape, data["rad"].dtype)
-#     print(data["rae"].shape, data["rae"].dtype)
-#     dataset = KRadarDataset("/home/local/xinyu/KRadar/1/radar_tesseract")
-#     data = dataset[0]
-#     print(dataset[0]['rae'].shape)

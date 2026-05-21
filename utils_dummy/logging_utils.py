@@ -3,6 +3,8 @@ from datetime import datetime
 
 from torch.utils.tensorboard import SummaryWriter
 
+from utils_dummy.checkpoints import format_sequence_run_name
+
 
 def print_training_history(history):
     if len(history) == 0:
@@ -50,9 +52,9 @@ def print_training_history(history):
         )
 
 
-def create_tensorboard_run_dir(base_dir, experiment_name, sequence):
+def create_tensorboard_writer(base_dir, experiment_name, sequence):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    run_name = f"seq{sequence}_{timestamp}"
+    run_name = f"{format_sequence_run_name(sequence)}_{timestamp}"
     log_dir = os.path.join(base_dir, experiment_name, run_name)
 
     suffix = 1
@@ -62,16 +64,7 @@ def create_tensorboard_run_dir(base_dir, experiment_name, sequence):
         suffix += 1
 
     os.makedirs(unique_log_dir, exist_ok=False)
-    return unique_log_dir
-
-
-def create_tensorboard_writer(base_dir, experiment_name, sequence):
-    log_dir = create_tensorboard_run_dir(
-        base_dir=base_dir,
-        experiment_name=experiment_name,
-        sequence=sequence
-    )
-    return SummaryWriter(log_dir=log_dir), log_dir
+    return SummaryWriter(log_dir=unique_log_dir)
 
 
 def write_tensorboard_run_config(
@@ -115,6 +108,9 @@ def write_tensorboard_metrics(writer, epoch, train_metrics, val_metrics, f1, lea
     writer.add_scalar("validation_metrics/val_recall", val_metrics["recall"], epoch)
     writer.add_scalar("validation_metrics/val_iou", val_metrics["val_iou"], epoch)
     writer.add_scalar("validation_metrics/val_f1", f1, epoch)
+    writer.add_scalar("validation_metrics/tp", val_metrics["tp"], epoch)
+    writer.add_scalar("validation_metrics/fp", val_metrics["fp"], epoch)
+    writer.add_scalar("validation_metrics/fn", val_metrics["fn"], epoch)
 
     writer.add_scalar("parameters/learning_rate", learning_rate, epoch)
     writer.add_scalar("parameters/eval_iou_thresh", val_metrics["iou_thresh"], epoch)

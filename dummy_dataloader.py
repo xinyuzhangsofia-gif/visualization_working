@@ -110,7 +110,7 @@ def build_train_val_dataloaders(
         num_workers=num_workers,
     )
 
-    return full_dataset, train_dataset, val_dataset, train_loader, val_loader
+    return train_dataset, val_dataset, train_loader, val_loader
 
 
 def prepare_model_inputs(batch, device):
