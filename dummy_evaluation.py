@@ -2,6 +2,7 @@ import argparse
 import os
 import re
 import torch
+import tqdm
 from dummy_dataloader import build_train_val_dataloaders, prepare_model_inputs
 from dummy_dataset import (
     class_to_idx_from_class_names,
@@ -12,15 +13,14 @@ from dummy_dataset import (
 from dummy_visualize import build_model, load_checkpoint, select_device
 from utils_dummy.checkpoints import get_num_classes_from_checkpoint
 from zxy_config import DataConfig
-import tqdm
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate dummy MVRSS checkpoints.")
     parser.add_argument("--checkpoint-root", default=
-                        "/home/local/xinyu/MVRSS/mvrss/checkpoints/mvrss_detection/seq11_20260520_105936_148715")
+                        "./checkpoints/mvrss_detection/seq1-11_20260522_183125_346849/global_best_epoch_021_20260522_200603_mAP_0p0913.pth")
     parser.add_argument("--epoch-step", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=45)
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -50,7 +50,6 @@ def get_checkpoint_class_info(checkpoint, num_boxes):
 
 
 def boxes_3d_to_ra_xyxy(boxes):
-
     r = boxes[:, 0]
     a = boxes[:, 1]
     r_w = boxes[:, 3]
@@ -65,7 +64,6 @@ def boxes_3d_to_ra_xyxy(boxes):
 
 
 def box_iou_2d(boxes1, boxes2):
-
     if boxes1.numel() == 0 or boxes2.numel() == 0:
         return torch.zeros(
             (boxes1.shape[0], boxes2.shape[0]),
@@ -185,9 +183,9 @@ def evaluate_precision_recall(
         device,
         num_classes,
         prepare_model_inputs,
-        score_thresh=0.5,
+        score_thresh=0.2, 
         iou_thresh=0.5,
-        max_detections=20
+        max_detections=64
     ):
     model.eval()
 
@@ -196,6 +194,7 @@ def evaluate_precision_recall(
     total_fn = 0
     total_iou = 0.0
     total_iou_count = 0
+    
     predictions_by_class = {class_id: [] for class_id in range(num_classes)}
     gt_by_class = {class_id: {} for class_id in range(num_classes)}
     image_counter = 0
@@ -210,12 +209,12 @@ def evaluate_precision_recall(
 
         foreground_probs = pred_probs[:, :, :num_classes]
         background_probs = pred_probs[:, :, num_classes]
-
         pred_scores, pred_labels = foreground_probs.max(dim=-1)
 
         batch_size = pred_boxes.shape[0]
 
         for b in range(batch_size):
+            # 1. Setup ID
             if "image_id" in batch:
                 image_id = batch["image_id"][b]
             elif "file_idx" in batch:
@@ -229,72 +228,73 @@ def evaluate_precision_recall(
             boxes_b = pred_boxes[b]
             background_scores_b = background_probs[b]
 
-            keep = (scores_b > score_thresh) & (scores_b > background_scores_b)
-            #keep = (scores_b > score_thresh)
-            pred_boxes_keep = boxes_b[keep]
-            pred_labels_keep = labels_b[keep]
-            pred_scores_keep = scores_b[keep]
-
-            if pred_scores_keep.shape[0] > max_detections:
-                topk_scores, topk_indices = pred_scores_keep.topk(max_detections)
-
-                pred_boxes_keep = pred_boxes_keep[topk_indices]
-                pred_labels_keep = pred_labels_keep[topk_indices]
-                pred_scores_keep = topk_scores
-
+            # 2. Extract Ground Truth
             gt_boxes_all = batch["gt_boxes"][b].to(device)
             gt_labels_all = batch["gt_labels"][b].to(device)
             valid_gt = gt_labels_all < num_classes
             gt_boxes = gt_boxes_all[valid_gt]
             gt_labels = gt_labels_all[valid_gt]
 
+            # Register GT for AP calculation
             for class_id in range(num_classes):
                 class_gt_boxes = gt_boxes[gt_labels == class_id].detach().cpu()
                 gt_by_class[class_id][image_id] = {"boxes": class_gt_boxes}
 
-            for pred_box, pred_label, pred_score in zip(
-                    pred_boxes_keep,
-                    pred_labels_keep,
-                    pred_scores_keep
-                ):
-                class_id = int(pred_label.item())
-                predictions_by_class[class_id].append({
+            # 3. Filter for mAP Calculation (NO SCORE THRESHOLD HERE)
+            map_keep = scores_b > background_scores_b
+            map_boxes = boxes_b[map_keep]
+            map_labels = labels_b[map_keep]
+            map_scores = scores_b[map_keep]
+
+            # Top-K for mAP
+            if map_scores.shape[0] > max_detections:
+                topk_scores, topk_indices = map_scores.topk(max_detections)
+                map_boxes = map_boxes[topk_indices]
+                map_labels = map_labels[topk_indices]
+                map_scores = topk_scores
+
+            # Populate predictions for rigorous mAP calculation
+            for pred_box, pred_label, pred_score in zip(map_boxes, map_labels, map_scores):
+                predictions_by_class[int(pred_label.item())].append({
                     "image_id": image_id,
                     "score": float(pred_score.item()),
                     "box": pred_box.detach().cpu(),
                 })
 
-            if pred_boxes_keep.shape[0] == 0:
+            # 4. Filter for Fixed-Point Metrics (TP/FP/FN/F1 at specific threshold)
+            point_keep = (map_scores > score_thresh)
+            point_boxes = map_boxes[point_keep]
+            point_labels = map_labels[point_keep]
+            point_scores = map_scores[point_keep]
+
+            if point_boxes.shape[0] == 0:
                 total_fn += gt_boxes.shape[0]
                 continue
 
             if gt_boxes.shape[0] == 0:
-                total_fp += pred_boxes_keep.shape[0]
+                total_fp += point_boxes.shape[0]
                 continue
 
-            pred_ra_boxes = boxes_3d_to_ra_xyxy(pred_boxes_keep)
+            # Calculate strict-point TP/FP
+            pred_ra_boxes = boxes_3d_to_ra_xyxy(point_boxes)
             gt_ra_boxes = boxes_3d_to_ra_xyxy(gt_boxes)
-
             ious = box_iou_2d(pred_ra_boxes, gt_ra_boxes)
 
             matched_gt = set()
-            order = pred_scores_keep.argsort(descending=True)
+            order = point_scores.argsort(descending=True)
 
             for pred_idx_tensor in order:
                 pred_idx = pred_idx_tensor.item()
-
                 best_iou = -1.0
                 best_gt_idx = -1
 
                 for gt_idx in range(gt_boxes.shape[0]):
                     if gt_idx in matched_gt:
                         continue
-
-                    if pred_labels_keep[pred_idx].item() != gt_labels[gt_idx].item():
+                    if point_labels[pred_idx].item() != gt_labels[gt_idx].item():
                         continue
 
                     iou_value = ious[pred_idx, gt_idx].item()
-
                     if iou_value > best_iou:
                         best_iou = iou_value
                         best_gt_idx = gt_idx
@@ -309,17 +309,17 @@ def evaluate_precision_recall(
 
             total_fn += gt_boxes.shape[0] - len(matched_gt)
 
+    # Calculate final metrics
     precision = total_tp / (total_tp + total_fp + 1e-6)
     recall = total_tp / (total_tp + total_fn + 1e-6)
     mean_iou = total_iou / max(total_iou_count, 1)
+    
     mean_ap, ap_per_class = compute_map(
         predictions_by_class=predictions_by_class,
         gt_by_class=gt_by_class,
         num_classes=num_classes,
         iou_thresh=iou_thresh
     )
-
-    model.train()
 
     return {
         "precision": precision,
@@ -331,47 +331,6 @@ def evaluate_precision_recall(
         "tp": total_tp,
         "fp": total_fp,
         "fn": total_fn,
-    }
-
-
-@torch.no_grad()
-def evaluate_train_val_iou(
-        model,
-        train_dataloader,
-        val_dataloader,
-        device,
-        num_classes,
-        prepare_model_inputs,
-        score_thresh=0.5,
-        iou_thresh=0.5,
-        max_detections=20
-    ):
-    train_eval_metrics = evaluate_precision_recall(
-        model=model,
-        dataloader=train_dataloader,
-        device=device,
-        num_classes=num_classes,
-        prepare_model_inputs=prepare_model_inputs,
-        score_thresh=score_thresh,
-        iou_thresh=iou_thresh,
-        max_detections=max_detections
-    )
-    val_eval_metrics = evaluate_precision_recall(
-        model=model,
-        dataloader=val_dataloader,
-        device=device,
-        num_classes=num_classes,
-        prepare_model_inputs=prepare_model_inputs,
-        score_thresh=score_thresh,
-        iou_thresh=iou_thresh,
-        max_detections=max_detections
-    )
-
-    return {
-        "train_eval_iou": train_eval_metrics["mean_iou"],
-        "val_eval_iou": val_eval_metrics["mean_iou"],
-        "train_eval_metrics": train_eval_metrics,
-        "val_eval_metrics": val_eval_metrics,
     }
 
 
@@ -410,8 +369,6 @@ def find_epoch_checkpoints(checkpoint_root, epoch_step):
 
     checkpoint_paths.sort(key=lambda item: item[0])
     return checkpoint_paths
-
-
 
 
 def class_ap_from_name(ap_per_class, class_names, target_name):
@@ -487,8 +444,6 @@ def print_results_table(results):
 
 
 def main():
-
-
     args = parse_args()
     device = select_device()
     cfg = DataConfig()
@@ -517,7 +472,7 @@ def main():
     if len(validation_dataset) == 0:
         raise ValueError("Validation split is empty. Adjust --train-ratio or --limit-samples.")
 
-    model = build_model(device=device,num_boxes=args.num_boxes,num_classes=num_classes)
+    model = build_model(device=device, num_boxes=args.num_boxes, num_classes=num_classes)
 
     def evaluate_checkpoint(checkpoint_path):
         load_checkpoint(
@@ -525,7 +480,7 @@ def main():
             checkpoint_path=checkpoint_path,
             device=device
         )
-        metrics=evaluate_precision_recall(
+        metrics = evaluate_precision_recall(
             model=model,
             dataloader=validation_loader,
             device=device,
@@ -533,7 +488,7 @@ def main():
             prepare_model_inputs=prepare_model_inputs,
             score_thresh=args.score_thresh,
             iou_thresh=args.eval_iou_thresh,
-            max_detections=min(args.num_boxes, 20)
+            max_detections=args.num_boxes
         )
         return metrics
 

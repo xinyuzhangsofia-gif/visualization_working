@@ -3,7 +3,7 @@ import argparse
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-from dummy_dataloader import (build_train_val_dataloaders,get_config_sequences,prepare_model_inputs)
+from dummy_dataloader import (build_train_val_dataloaders, get_config_sequences, prepare_model_inputs)
 from dummy_dataset import build_class_mapping_from_gt_paths
 from dummy_evaluation import boxes_3d_to_ra_xyxy, box_iou_2d, evaluate_train_val_iou
 from dummy_module import MVRSS3DModel
@@ -137,6 +137,7 @@ def hungarian_cost_match(
     )
     return matched_pred_indices, matched_gt_indices
 
+
 def detection_loss(
         outputs,
         gt_boxes_list,
@@ -184,36 +185,20 @@ def detection_loss(
             continue
 
         pred_boxes_b = pred_boxes[b]
-        matched_pred_indices, matched_gt_indices = greedy_cost_match(
-                pred_boxes=pred_boxes_b,
-                gt_boxes=gt_boxes,
-                cost_bbox=1.0,
-                cost_iou=1.0
-                )
 
-        # matched_pred_indices, matched_gt_indices = hungarian_cost_match(
-        #     pred_boxes=pred_boxes_b,
-        #     gt_boxes=gt_boxes,
-        #     cost_bbox=1.0,
-        #     cost_iou=1.0
-        # )
+        # Use Hungarian match for stable, global assignment
+        matched_pred_indices, matched_gt_indices = hungarian_cost_match(
+            pred_boxes=pred_boxes_b,
+            gt_boxes=gt_boxes,
+            cost_bbox=1.0,
+            cost_iou=1.0
+        )
 
         if matched_pred_indices.numel() == 0:
             continue
 
-        matched_ious = box_iou_2d(
-            boxes_3d_to_ra_xyxy(pred_boxes_b[matched_pred_indices]),
-            boxes_3d_to_ra_xyxy(gt_boxes[matched_gt_indices])
-        ).diag()
-        keep_matches = matched_ious >= match_iou_thresh
-        matched_pred_indices = matched_pred_indices[keep_matches]
-        matched_gt_indices = matched_gt_indices[keep_matches]
-
-        if matched_pred_indices.numel() == 0:
-            continue
-
+        # Keep all matches regardless of IoU to prevent the cold start trap
         target_classes[b, matched_pred_indices] = gt_labels[matched_gt_indices]
-
         
         matched_pred_boxes_all.append(
             pred_boxes_b[matched_pred_indices]
@@ -235,10 +220,26 @@ def detection_loss(
         matched_pred_boxes_all = torch.cat(matched_pred_boxes_all, dim=0)
         matched_gt_boxes_all = torch.cat(matched_gt_boxes_all, dim=0)
 
-        box_loss = F.smooth_l1_loss(
-            matched_pred_boxes_all,
-            matched_gt_boxes_all
-        )
+        # 1. Coordinate distance loss (L1 instead of Smooth L1)
+        pred_boxes_dim = matched_pred_boxes_all[:, :6]
+        gt_boxes_dim = matched_gt_boxes_all[:, :6]
+        loss_dim = F.l1_loss(pred_boxes_dim, gt_boxes_dim)
+
+        # 2. Circular angle loss (Dim 6)
+        pred_angles = matched_pred_boxes_all[:, 6]
+        gt_angles = matched_gt_boxes_all[:, 6]
+        angle_diff = torch.abs(pred_angles - gt_angles)
+        angle_diff = torch.min(angle_diff, 1.0 - angle_diff) # Wrap around!
+        loss_angle = angle_diff.mean()
+
+        # 3. IoU loss integration
+        pred_ra = boxes_3d_to_ra_xyxy(matched_pred_boxes_all)
+        gt_ra = boxes_3d_to_ra_xyxy(matched_gt_boxes_all)
+        ious = box_iou_2d(pred_ra, gt_ra).diag()
+        loss_iou = (1.0 - ious).mean()
+
+        # Typical set-prediction weighting: IoU carries heavier influence than L1 distance
+        box_loss = loss_dim + loss_angle + (2.0 * loss_iou)
     else:
         box_loss = torch.tensor(0.0, device=device)
 
@@ -254,6 +255,7 @@ def detection_loss(
     }
 
     return total_loss, loss_dict
+
 
 def train_one_epoch(
         model,
@@ -371,14 +373,15 @@ def validate_loss(
         "val_cls_loss": cls_loss_sum / max(num_batches, 1),
     }
 
+
 def argparse_args():
     parser = argparse.ArgumentParser(description="Train the dummy MVRSS detection module.")
     parser.add_argument("--epochs", type=int, default=25)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=40)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num-boxes", type=int, default=64)
     parser.add_argument("--background-weight", type=float, default=0.6)
-    parser.add_argument("--match-iou-thresh", type=float, default=0)  #ddddd
+    parser.add_argument("--match-iou-thresh", type=float, default=0)
     parser.add_argument("--score-thresh", type=float, default=0.2)
     parser.add_argument("--eval-iou-thresh", type=float, default=0.1)
     parser.add_argument("--train-ratio", type=float, default=0.7)
@@ -556,7 +559,6 @@ def main():
         )
     writer.close()
 
-    # print_training_history(history)
     save_global_best_checkpoint(
         best_state=best_state,
         checkpoint_dirs=checkpoint_dirs,

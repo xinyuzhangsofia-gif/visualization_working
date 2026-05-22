@@ -28,8 +28,6 @@ CLASS_NAMES = {
     4: "Pedestrian",
     5: "Pedestrian Group",
 }
-NUM_CLASSES = len(CLASS_NAMES)
-MAX_DETECTIONS = 20
 
 
 def get_checkpoint_class_info(checkpoint, num_boxes):
@@ -55,19 +53,20 @@ def parse_args():
         description="Visualize ground-truth and predicted boxes on RA maps."
     )
     parser.add_argument("--checkpoint-path", 
-                        default="/home/local/xinyu/MVRSS/mvrss/checkpoints/mvrss_detection/\
-                            seq1-11_20260522_101532_180331/best_epoch_011_20260522_121726_mAP_0p0000.pth")
+                        default="./checkpoints/mvrss_detection/seq1-11_20260522_183125_346849/global_best_epoch_021_20260522_200603_mAP_0p0913.pth")
     parser.add_argument("--sequence", type=int, default=None)
     parser.add_argument("--start-file-idx", type=int, default=0)
     parser.add_argument("--frame-step", type=int, default=100)
-    parser.add_argument("--max-frames",type=int,default=0)
+    parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--score-thresh", type=float, default=0.2)
-    parser.add_argument("--save-images", action="store_true")
-    parser.add_argument("--save-dir", default="ra_vis")
+    parser.add_argument("--num-boxes", type=int, default=64)
+    parser.add_argument("--save-images", action="store_true", help="Save visualizations to disk.")
+    parser.add_argument("--no-display", action="store_true", help="Do not display images to the screen (useful for background saving).")
+    parser.add_argument("--save-dir", default="./ra_vis")
     return parser.parse_args()
 
 
-def build_model(device, num_boxes=64, num_classes=NUM_CLASSES):
+def build_model(device, num_boxes, num_classes):
     model = MVRSS3DModel(
         d_in=64,
         e_in=37,
@@ -117,12 +116,20 @@ def normalized_boxes_to_raw_rae(boxes, rae_shape):
 
     r_size, a_size, e_size = rae_shape
     raw = boxes.clone()
+    
+    # Un-normalize center coordinates
     raw[:, 0] = raw[:, 0] * r_size
     raw[:, 1] = raw[:, 1] * a_size
     raw[:, 2] = raw[:, 2] * e_size
+    
+    # Un-normalize widths
     raw[:, 3] = raw[:, 3] * r_size
     raw[:, 4] = raw[:, 4] * a_size
     raw[:, 5] = raw[:, 5] * e_size
+    
+    # Un-normalize angle (mapped back from [0,1] to [-pi, pi])
+    raw[:, 6] = (raw[:, 6] * 2.0 * np.pi) - np.pi
+    
     return raw
 
 
@@ -284,14 +291,13 @@ def main():
     checkpoint = torch.load(checkpoint_path, map_location=device)
     num_classes, class_names, class_to_idx = get_checkpoint_class_info(
         checkpoint=checkpoint,
-        num_boxes=64
+        num_boxes=args.num_boxes
     )
     checkpoint_config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
     train_ratio = checkpoint_config.get("train_ratio", 0.7)
     seed = checkpoint_config.get("seed", 42)
     print(f"Visualization classes: {class_names}")
 
-    #dataset = build_dataset(cfg)
     train_dataset, val_dataset, train_loader, val_loader = build_train_val_dataloaders(
                                         cfg=cfg,
                                         batch_size=1,
@@ -309,7 +315,7 @@ def main():
         f"device={device}"
     )
 
-    model = build_model(device, num_classes=num_classes)
+    model = build_model(device, num_boxes=args.num_boxes, num_classes=num_classes)
     model = load_checkpoint(model, checkpoint_path, device)
 
     if args.save_images:
@@ -334,7 +340,7 @@ def main():
             file_idx=val_idx,
             device=device,
             score_thresh=args.score_thresh,
-            max_detections=MAX_DETECTIONS,
+            max_detections=args.num_boxes,
             num_classes=num_classes,
         )
 
@@ -360,8 +366,9 @@ def main():
             fig.savefig(output_path, dpi=160)
             print(f"saved={output_path}")
 
-        print("Close the matplotlib window to continue.")
-        plt.show()
+        if not args.no_display:
+            print("Close the matplotlib window to continue.")
+            plt.show()
 
         plt.close(fig)
         rendered_count += 1
