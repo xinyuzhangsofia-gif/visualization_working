@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from dummy_dataloader import (build_train_val_dataloaders, get_config_sequences, prepare_model_inputs)
 from dummy_dataset import build_class_mapping_from_gt_paths
-from dummy_evaluation import boxes_3d_to_ra_xyxy, box_iou_2d, evaluate_train_val_iou
+from dummy_evaluation import boxes_3d_to_ra_xyxy, evaluate_train_val_iou
 from dummy_module import MVRSS3DModel
 from utils_dummy.checkpoints import *
 from utils_dummy.logging_utils import *
@@ -14,80 +14,45 @@ from zxy_config import DataConfig
 from zxy_data_path import get_gt_txt_path
 
 
-@torch.no_grad()
-def greedy_cost_match(
-        pred_boxes,
-        gt_boxes,
-        cost_bbox=1.0,
-        cost_iou=1.0
-    ):
-    device = pred_boxes.device
+def pairwise_box_giou_2d(boxes1, boxes2):
+    """
+    Computes Generalized IoU (GIoU) between two sets of boxes.
+    Boxes should be in [x_min, y_min, x_max, y_max] format.
+    """
+    if boxes1.shape[0] == 0 or boxes2.shape[0] == 0:
+        return torch.zeros((boxes1.shape[0], boxes2.shape[0]), device=boxes1.device)
 
-    if pred_boxes.shape[0] == 0 or gt_boxes.shape[0] == 0:
-        return (
-            torch.empty(0, dtype=torch.long, device=device),
-            torch.empty(0, dtype=torch.long, device=device)
-        )
+    # Standard IoU Intersections
+    left_top = torch.max(boxes1[:, None, :2], boxes2[None, :, :2])
+    right_bottom = torch.min(boxes1[:, None, 2:], boxes2[None, :, 2:])
+    wh = (right_bottom - left_top).clamp(min=0)
+    inter = wh[:, :, 0] * wh[:, :, 1]
 
-    bbox_cost = torch.cdist(
-        pred_boxes[:, :6],
-        gt_boxes[:, :6],
-        p=1
-    )
+    # Areas
+    area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0)
+    area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0)
+    union = area1[:, None] + area2[None, :] - inter + 1e-6
+    iou = inter / union
 
-    pred_ra_boxes = boxes_3d_to_ra_xyxy(pred_boxes)
-    gt_ra_boxes = boxes_3d_to_ra_xyxy(gt_boxes)
+    # Enclosing Box
+    enclose_left_top = torch.min(boxes1[:, None, :2], boxes2[None, :, :2])
+    enclose_right_bottom = torch.max(boxes1[:, None, 2:], boxes2[None, :, 2:])
+    enclose_wh = (enclose_right_bottom - enclose_left_top).clamp(min=0)
+    enclose_area = enclose_wh[:, :, 0] * enclose_wh[:, :, 1] + 1e-6
 
-    ious = box_iou_2d(pred_ra_boxes, gt_ra_boxes)
-    iou_cost = 1.0 - ious
+    # GIoU Calculation
+    giou = iou - (enclose_area - union) / enclose_area
+    return giou
 
-    total_cost = cost_bbox * bbox_cost + cost_iou * iou_cost
 
-    flat_cost = total_cost.reshape(-1)
-    order = flat_cost.argsort(descending=False)
-
-    matched_pred = []
-    matched_gt = []
-
-    used_pred = set()
-    used_gt = set()
-
-    num_gt = gt_boxes.shape[0]
-
-    for flat_idx in order:
-        flat_idx = flat_idx.item()
-
-        pred_idx = flat_idx // num_gt
-        gt_idx = flat_idx % num_gt
-
-        if pred_idx in used_pred:
-            continue
-
-        if gt_idx in used_gt:
-            continue
-
-        matched_pred.append(pred_idx)
-        matched_gt.append(gt_idx)
-
-        used_pred.add(pred_idx)
-        used_gt.add(gt_idx)
-
-        if len(used_gt) == num_gt:
-            break
-
-    matched_pred_indices = torch.tensor(
-        matched_pred,
-        dtype=torch.long,
-        device=device
-    )
-
-    matched_gt_indices = torch.tensor(
-        matched_gt,
-        dtype=torch.long,
-        device=device
-    )
-
-    return matched_pred_indices, matched_gt_indices
+def focal_loss_fn(logits, targets, class_weights, gamma=2.0):
+    """
+    Applies Focal Loss to combat the massive background class imbalance.
+    """
+    ce_loss = F.cross_entropy(logits, targets, weight=class_weights, reduction='none')
+    pt = torch.exp(-ce_loss) # Get the predicted probability for the target class
+    focal_term = (1.0 - pt) ** gamma
+    return (focal_term * ce_loss).mean()
 
 
 @torch.no_grad()
@@ -95,7 +60,7 @@ def hungarian_cost_match(
         pred_boxes,
         gt_boxes,
         cost_bbox=1.0,
-        cost_iou=1.0
+        cost_giou=2.0  # Increased priority for IoU overlap
     ):
     device = pred_boxes.device
 
@@ -105,36 +70,25 @@ def hungarian_cost_match(
             torch.empty(0, dtype=torch.long, device=device)
         )
 
-    bbox_cost = torch.cdist(
-        pred_boxes[:, :6],
-        gt_boxes[:, :6],
-        p=1
-    )
+    bbox_cost = torch.cdist(pred_boxes[:, :6], gt_boxes[:, :6], p=1)
 
     pred_ra_boxes = boxes_3d_to_ra_xyxy(pred_boxes)
     gt_ra_boxes = boxes_3d_to_ra_xyxy(gt_boxes)
 
-    ious = box_iou_2d(pred_ra_boxes, gt_ra_boxes)
-    iou_cost = 1.0 - ious
+    # Use GIoU for matching cost instead of standard IoU
+    gious = pairwise_box_giou_2d(pred_ra_boxes, gt_ra_boxes)
+    giou_cost = 1.0 - gious
 
-    total_cost = cost_bbox * bbox_cost + cost_iou * iou_cost
+    total_cost = cost_bbox * bbox_cost + cost_giou * giou_cost
 
     cost_matrix = total_cost.detach().cpu().numpy()
 
     from scipy.optimize import linear_sum_assignment
     matched_pred, matched_gt = linear_sum_assignment(cost_matrix)
 
-    matched_pred_indices = torch.as_tensor(
-        matched_pred,
-        dtype=torch.long,
-        device=device
-    )
-
-    matched_gt_indices = torch.as_tensor(
-        matched_gt,
-        dtype=torch.long,
-        device=device
-    )
+    matched_pred_indices = torch.as_tensor(matched_pred, dtype=torch.long, device=device)
+    matched_gt_indices = torch.as_tensor(matched_gt, dtype=torch.long, device=device)
+    
     return matched_pred_indices, matched_gt_indices
 
 
@@ -145,21 +99,13 @@ def detection_loss(
         num_classes,
         box_loss_weight=1.0,
         cls_loss_weight=1.0,
-        background_weight=0.1,
-        match_iou_thresh=0.05
+        background_weight=0.5
     ):
     if isinstance(outputs, dict):
         pred_boxes = outputs["box_pred"].sigmoid()
         pred_logits = outputs["cls_pred"]
     else:
         box_dim = 7
-        expected_output_dim = box_dim + num_classes + 1
-
-        if outputs.shape[-1] != expected_output_dim:
-            raise ValueError(
-                f"Expected output dim {expected_output_dim}, got {outputs.shape[-1]}"
-            )
-
         pred_boxes = outputs[:, :, :box_dim].sigmoid()
         pred_logits = outputs[:, :, box_dim:]
 
@@ -186,67 +132,59 @@ def detection_loss(
 
         pred_boxes_b = pred_boxes[b]
 
-        # Use Hungarian match for stable, global assignment
         matched_pred_indices, matched_gt_indices = hungarian_cost_match(
             pred_boxes=pred_boxes_b,
             gt_boxes=gt_boxes,
             cost_bbox=1.0,
-            cost_iou=1.0
+            cost_giou=2.0 
         )
 
         if matched_pred_indices.numel() == 0:
             continue
 
-        # Keep all matches regardless of IoU to prevent the cold start trap
         target_classes[b, matched_pred_indices] = gt_labels[matched_gt_indices]
         
-        matched_pred_boxes_all.append(
-            pred_boxes_b[matched_pred_indices]
-        )
-        matched_gt_boxes_all.append(
-            gt_boxes[matched_gt_indices]
-        )
+        matched_pred_boxes_all.append(pred_boxes_b[matched_pred_indices])
+        matched_gt_boxes_all.append(gt_boxes[matched_gt_indices])
 
     class_weights = torch.ones(num_classes + 1, device=device)
     class_weights[-1] = background_weight
 
-    cls_loss = F.cross_entropy(
+    # 1. Classification Loss (Upgraded to Focal Loss)
+    cls_loss = focal_loss_fn(
         pred_logits.reshape(-1, num_classes + 1),
         target_classes.reshape(-1),
-        weight=class_weights
+        class_weights=class_weights,
+        gamma=2.0
     )
 
     if len(matched_pred_boxes_all) > 0:
         matched_pred_boxes_all = torch.cat(matched_pred_boxes_all, dim=0)
         matched_gt_boxes_all = torch.cat(matched_gt_boxes_all, dim=0)
 
-        # 1. Coordinate distance loss (L1 instead of Smooth L1)
+        # 2. Coordinate distance loss (L1)
         pred_boxes_dim = matched_pred_boxes_all[:, :6]
         gt_boxes_dim = matched_gt_boxes_all[:, :6]
         loss_dim = F.l1_loss(pred_boxes_dim, gt_boxes_dim)
 
-        # 2. Circular angle loss (Dim 6)
+        # 3. Circular angle loss (Dim 6)
         pred_angles = matched_pred_boxes_all[:, 6]
         gt_angles = matched_gt_boxes_all[:, 6]
         angle_diff = torch.abs(pred_angles - gt_angles)
-        angle_diff = torch.min(angle_diff, 1.0 - angle_diff) # Wrap around!
+        angle_diff = torch.min(angle_diff, 1.0 - angle_diff) 
         loss_angle = angle_diff.mean()
 
-        # 3. IoU loss integration
+        # 4. GIoU loss integration (Upgraded from standard IoU)
         pred_ra = boxes_3d_to_ra_xyxy(matched_pred_boxes_all)
         gt_ra = boxes_3d_to_ra_xyxy(matched_gt_boxes_all)
-        ious = box_iou_2d(pred_ra, gt_ra).diag()
-        loss_iou = (1.0 - ious).mean()
+        gious = pairwise_box_giou_2d(pred_ra, gt_ra).diag()
+        loss_giou = (1.0 - gious).mean()
 
-        # Typical set-prediction weighting: IoU carries heavier influence than L1 distance
-        box_loss = loss_dim + loss_angle + (2.0 * loss_iou)
+        box_loss = loss_dim + loss_angle + (2.0 * loss_giou)
     else:
         box_loss = torch.tensor(0.0, device=device)
 
-    total_loss = (
-        box_loss_weight * box_loss
-        + cls_loss_weight * cls_loss
-    )
+    total_loss = (box_loss_weight * box_loss) + (cls_loss_weight * cls_loss)
 
     loss_dict = {
         "total_loss": total_loss.item(),
@@ -267,8 +205,7 @@ def train_one_epoch(
         num_epochs=None,
         box_loss_weight=1.0,
         cls_loss_weight=1.0,
-        background_weight=0.1,
-        match_iou_thresh=0.05
+        background_weight=0.5
     ):
     model.train()
 
@@ -277,11 +214,7 @@ def train_one_epoch(
     cls_loss_sum = 0.0
     num_batches = 0
 
-    if epoch is not None and num_epochs is not None:
-        desc = f"Epoch {epoch + 1}/{num_epochs}"
-    else:
-        desc = "Training"
-
+    desc = f"Epoch {epoch + 1}/{num_epochs}" if epoch is not None else "Training"
     pbar = tqdm(dataloader, desc=desc, ncols=120)
 
     for batch in pbar:
@@ -295,8 +228,7 @@ def train_one_epoch(
             num_classes=num_classes,
             box_loss_weight=box_loss_weight,
             cls_loss_weight=cls_loss_weight,
-            background_weight=background_weight,
-            match_iou_thresh=match_iou_thresh
+            background_weight=background_weight
         )
 
         optimizer.zero_grad()
@@ -308,24 +240,16 @@ def train_one_epoch(
         cls_loss_sum += loss_dict["cls_loss"]
         num_batches += 1
 
-        avg_loss = total_loss_sum / num_batches
-        avg_box = box_loss_sum / num_batches
-        avg_cls = cls_loss_sum / num_batches
-
         pbar.set_postfix({
-            "loss": f"{avg_loss:.4f}",
-            "box": f"{avg_box:.4f}",
-            "cls": f"{avg_cls:.4f}",
+            "loss": f"{(total_loss_sum / num_batches):.4f}",
+            "box": f"{(box_loss_sum / num_batches):.4f}",
+            "cls": f"{(cls_loss_sum / num_batches):.4f}",
         })
 
-    avg_total_loss = total_loss_sum / max(num_batches, 1)
-    avg_box_loss = box_loss_sum / max(num_batches, 1)
-    avg_cls_loss = cls_loss_sum / max(num_batches, 1)
-
     return {
-        "train_loss": avg_total_loss,
-        "train_box_loss": avg_box_loss,
-        "train_cls_loss": avg_cls_loss,
+        "train_loss": total_loss_sum / max(num_batches, 1),
+        "train_box_loss": box_loss_sum / max(num_batches, 1),
+        "train_cls_loss": cls_loss_sum / max(num_batches, 1),
     }
 
 
@@ -337,8 +261,7 @@ def validate_loss(
         num_classes,
         box_loss_weight=1.0,
         cls_loss_weight=1.0,
-        background_weight=0.1,
-        match_iou_thresh=0.05
+        background_weight=0.5
     ):
     model.eval()
 
@@ -358,8 +281,7 @@ def validate_loss(
             num_classes=num_classes,
             box_loss_weight=box_loss_weight,
             cls_loss_weight=cls_loss_weight,
-            background_weight=background_weight,
-            match_iou_thresh=match_iou_thresh
+            background_weight=background_weight
         )
 
         total_loss_sum += loss_dict["total_loss"]
@@ -376,13 +298,13 @@ def validate_loss(
 
 def argparse_args():
     parser = argparse.ArgumentParser(description="Train the dummy MVRSS detection module.")
-    parser.add_argument("--epochs", type=int, default=25)
-    parser.add_argument("--batch-size", type=int, default=40)
+    # Training timeline increased to allow the Hungarian Matcher to stabilize
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num-boxes", type=int, default=64)
-    parser.add_argument("--background-weight", type=float, default=0.6)
-    parser.add_argument("--match-iou-thresh", type=float, default=0)
-    parser.add_argument("--score-thresh", type=float, default=0.2)
+    parser.add_argument("--background-weight", type=float, default=0.5)
+    parser.add_argument("--score-thresh", type=float, default=0.4)
     parser.add_argument("--eval-iou-thresh", type=float, default=0.1)
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=42)
@@ -396,18 +318,15 @@ def argparse_args():
 
 
 def main():
-
     args = argparse_args()
     if args.best_window_size <= 0:
-        raise ValueError(f"--best-window-size must be greater than 0, got {args.best_window_size}")
+        raise ValueError(f"--best-window-size must be greater than 0")
 
     set_seed(args.seed)
     cfg = DataConfig()
     configured_sequences = get_config_sequences(cfg)
-    gt_paths = [
-        get_gt_txt_path(cfg, sequence=sequence)
-        for sequence in configured_sequences
-    ]
+    gt_paths = [get_gt_txt_path(cfg, sequence=s) for s in configured_sequences]
+    
     class_names, class_to_idx = build_class_mapping_from_gt_paths(gt_paths)
     num_classes = len(class_names)
     args.num_classes = num_classes
@@ -417,7 +336,7 @@ def main():
     print(f"Training classes: {class_names}")
 
     device = torch.device("cuda")
-    (train_dataset,val_dataset,train_loader,val_loader) = build_train_val_dataloaders(
+    (train_dataset, val_dataset, train_loader, val_loader) = build_train_val_dataloaders(
         cfg=cfg,
         batch_size=args.batch_size,
         train_ratio=args.train_ratio,
@@ -425,9 +344,9 @@ def main():
         num_workers=args.num_workers,
         limit_samples=args.limit_samples,
         class_to_idx=class_to_idx
-        )
+    )
     if len(val_dataset) == 0:
-        raise ValueError("Validation split is empty. Adjust --train-ratio or --limit-samples.")
+        raise ValueError("Validation split is empty.")
 
     model = MVRSS3DModel(
         d_in=64,
@@ -459,20 +378,14 @@ def main():
         experiment_name="mvrss_detection",
         sequence=configured_sequences
     )
+    
     write_tensorboard_run_config(
-        writer=writer,
-        cfg=cfg,
-        num_epochs=args.epochs,
-        batch_size=args.batch_size,
-        train_size=len(train_dataset),
-        val_size=len(val_dataset),
-        learning_rate=args.lr,
-        num_boxes=args.num_boxes,
-        num_classes=num_classes,
-        class_names=class_names,
-        background_weight=args.background_weight,
-        eval_iou_thresh=args.eval_iou_thresh
+        writer=writer, cfg=cfg, num_epochs=args.epochs, batch_size=args.batch_size,
+        train_size=len(train_dataset), val_size=len(val_dataset), learning_rate=args.lr,
+        num_boxes=args.num_boxes, num_classes=num_classes, class_names=class_names,
+        background_weight=args.background_weight, eval_iou_thresh=args.eval_iou_thresh
     )
+
     for epoch in range(args.epochs):
         train_metrics = train_one_epoch(
             model=model,
@@ -484,9 +397,9 @@ def main():
             num_epochs=args.epochs,
             box_loss_weight=1.0,
             cls_loss_weight=1.0,
-            background_weight=args.background_weight,
-            match_iou_thresh=args.match_iou_thresh
+            background_weight=args.background_weight
         )
+        
         val_loss_metrics = validate_loss(
             model=model,
             dataloader=val_loader,
@@ -494,9 +407,9 @@ def main():
             num_classes=num_classes,
             box_loss_weight=1.0,
             cls_loss_weight=1.0,
-            background_weight=args.background_weight,
-            match_iou_thresh=args.match_iou_thresh
+            background_weight=args.background_weight
         )
+        
         eval_metrics = evaluate_train_val_iou(
             model=model,
             train_dataloader=train_loader,
@@ -506,8 +419,9 @@ def main():
             prepare_model_inputs=prepare_model_inputs,
             score_thresh=args.score_thresh,
             iou_thresh=args.eval_iou_thresh,
-            max_detections=min(args.num_boxes, 20)
+            max_detections=args.num_boxes
         )
+        
         val_metrics, f1 = build_epoch_eval_metrics(
             train_metrics=train_metrics,
             eval_metrics=eval_metrics,
@@ -516,54 +430,31 @@ def main():
 
         learning_rate = optimizer.param_groups[0]["lr"]
         write_tensorboard_metrics(
-            writer=writer,
-            epoch=epoch + 1,
-            train_metrics=train_metrics,
-            val_metrics=val_metrics,
-            f1=f1,
-            learning_rate=learning_rate
+            writer=writer, epoch=epoch + 1, train_metrics=train_metrics,
+            val_metrics=val_metrics, f1=f1, learning_rate=learning_rate
         )
 
         checkpoint_path = save_epoch_and_update_best_checkpoint(
-            best_state=best_state,
-            checkpoint_dir=checkpoint_dir,
-            model=model,
-            optimizer=optimizer,
-            args=args,
-            cfg=cfg,
-            epoch=epoch + 1,
-            train_metrics=train_metrics,
-            val_metrics=val_metrics,
-            f1=f1,
+            best_state=best_state, checkpoint_dir=checkpoint_dir, model=model,
+            optimizer=optimizer, args=args, cfg=cfg, epoch=epoch + 1,
+            train_metrics=train_metrics, val_metrics=val_metrics, f1=f1,
             learning_rate=learning_rate
         )
 
         save_window_best_checkpoint_if_ready(
-            window_best_state=window_best_state,
-            checkpoint_dirs=checkpoint_dirs,
-            checkpoint_key=checkpoint_key,
-            checkpoint_path=checkpoint_path,
-            epoch=epoch + 1,
-            total_epochs=args.epochs,
-            train_metrics=train_metrics,
-            val_metrics=val_metrics,
-            f1=f1,
-            window_size=args.best_window_size
+            window_best_state=window_best_state, checkpoint_dirs=checkpoint_dirs,
+            checkpoint_key=checkpoint_key, checkpoint_path=checkpoint_path,
+            epoch=epoch + 1, total_epochs=args.epochs, train_metrics=train_metrics,
+            val_metrics=val_metrics, f1=f1, window_size=args.best_window_size
         )
+        
         append_training_history(
-            history=history,
-            epoch=epoch + 1,
-            train_metrics=train_metrics,
-            val_metrics=val_metrics,
-            f1=f1
+            history=history, epoch=epoch + 1, train_metrics=train_metrics,
+            val_metrics=val_metrics, f1=f1
         )
+        
     writer.close()
-
-    save_global_best_checkpoint(
-        best_state=best_state,
-        checkpoint_dirs=checkpoint_dirs,
-        checkpoint_key=checkpoint_key
-    )
+    save_global_best_checkpoint(best_state=best_state, checkpoint_dirs=checkpoint_dirs, checkpoint_key=checkpoint_key)
 
 if __name__ == "__main__":
     main()
