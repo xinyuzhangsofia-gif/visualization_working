@@ -1,4 +1,5 @@
 import os
+import path_setup
 import cv2
 import matplotlib
 matplotlib.use("Agg")

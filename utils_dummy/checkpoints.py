@@ -1,5 +1,6 @@
 import os
 import shutil
+import copy
 from datetime import datetime
 
 import torch
@@ -74,12 +75,14 @@ def build_checkpoint_payload(
         f1,
         learning_rate,
         saved_at,
-        is_best
+        is_best,
+        clone_for_memory=False
     ):
-    return {
+    model_for_state_dict = model.module if isinstance(model, torch.nn.DataParallel) else model
+    payload = {
         "epoch": epoch,
         "saved_at": saved_at,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": model_for_state_dict.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "train_metrics": train_metrics,
         "val_metrics": val_metrics,
@@ -99,14 +102,36 @@ def build_checkpoint_payload(
             "class_names": getattr(args, "class_names", None),
             "class_to_idx": getattr(args, "class_to_idx", None),
             "background_weight": args.background_weight,
-            "match_iou_thresh": args.match_iou_thresh,
+            "match_iou_thresh": getattr(args, "match_iou_thresh", None),
             "score_thresh": args.score_thresh,
             "eval_iou_thresh": args.eval_iou_thresh,
             "train_ratio": args.train_ratio,
+            "split_mode": getattr(args, "split_mode", None),
+            "split_dir": getattr(args, "split_dir", None),
             "seed": args.seed,
             "limit_samples": args.limit_samples,
         },
     }
+
+    if clone_for_memory:
+        payload = clone_checkpoint_payload_for_memory(payload)
+
+    return payload
+
+
+def clone_checkpoint_payload_for_memory(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {
+            key: clone_checkpoint_payload_for_memory(child_value)
+            for key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        return [clone_checkpoint_payload_for_memory(child_value) for child_value in value]
+    if isinstance(value, tuple):
+        return tuple(clone_checkpoint_payload_for_memory(child_value) for child_value in value)
+    return copy.deepcopy(value)
 
 
 def get_model_state_dict_from_checkpoint(checkpoint):
@@ -193,6 +218,67 @@ def save_named_checkpoint_copy(
     best_checkpoint_path = os.path.join(checkpoint_dir, best_filename)
     shutil.copy2(source_checkpoint_path, best_checkpoint_path)
     return best_checkpoint_path
+
+
+def save_named_checkpoint_payload(
+        checkpoint_dir,
+        payload,
+        best_epoch,
+        best_map,
+        name_prefix
+    ):
+    saved_at = datetime.now().strftime("%Y%m%d_%H%M%S")
+    map_text = metric_for_filename(best_map)
+    best_filename = (
+        f"{name_prefix}_epoch_{best_epoch:03d}_{saved_at}_mAP_{map_text}.pth"
+    )
+    best_checkpoint_path = os.path.join(checkpoint_dir, best_filename)
+    torch.save(payload, best_checkpoint_path)
+    return best_checkpoint_path
+
+
+def remove_named_checkpoints(checkpoint_dir, name_prefix):
+    if not os.path.isdir(checkpoint_dir):
+        return
+
+    filename_prefix = f"{name_prefix}_epoch_"
+    for filename in os.listdir(checkpoint_dir):
+        if filename.startswith(filename_prefix) and filename.endswith(".pth"):
+            os.remove(os.path.join(checkpoint_dir, filename))
+
+
+def save_replacing_named_checkpoint_copy(
+        checkpoint_dir,
+        source_checkpoint_path,
+        best_epoch,
+        best_map,
+        name_prefix
+    ):
+    remove_named_checkpoints(checkpoint_dir, name_prefix)
+    return save_named_checkpoint_copy(
+        checkpoint_dir=checkpoint_dir,
+        source_checkpoint_path=source_checkpoint_path,
+        best_epoch=best_epoch,
+        best_map=best_map,
+        name_prefix=name_prefix
+    )
+
+
+def save_replacing_named_checkpoint_payload(
+        checkpoint_dir,
+        payload,
+        best_epoch,
+        best_map,
+        name_prefix
+    ):
+    remove_named_checkpoints(checkpoint_dir, name_prefix)
+    return save_named_checkpoint_payload(
+        checkpoint_dir=checkpoint_dir,
+        payload=payload,
+        best_epoch=best_epoch,
+        best_map=best_map,
+        name_prefix=name_prefix
+    )
 
 
 def save_best_checkpoint_copy(checkpoint_dir, source_checkpoint_path, best_epoch, best_map):

@@ -1,3 +1,5 @@
+import os
+
 import torch
 from torch.utils.data import DataLoader, Subset
 
@@ -29,7 +31,7 @@ def build_detection_dataset_for_sequence(
         cfg,
         sequence,
         class_to_idx=None,
-        ignore_unmapped_classes=False
+        ignore_unmapped_classes=True
     ):
     radar_dataset = KRadarRADRAEDataset(
         get_rad_rae_npy_root_dir(),
@@ -53,7 +55,9 @@ def build_train_val_dataloaders(
     num_workers,
     limit_samples,
     class_to_idx=None,
-    ignore_unmapped_classes=False,
+    ignore_unmapped_classes=True,
+    split_mode="random",
+    split_dir="split",
 ):
     sequence_datasets = [
         build_detection_dataset_for_sequence(
@@ -68,6 +72,56 @@ def build_train_val_dataloaders(
         sequence_datasets=sequence_datasets
     )
 
+    if split_mode == "random":
+        train_indices, val_indices = build_random_split_indices(
+            full_dataset=full_dataset,
+            train_ratio=train_ratio,
+            seed=seed,
+            limit_samples=limit_samples,
+        )
+    elif split_mode == "file":
+        train_indices, val_indices = build_file_split_indices(
+            full_dataset=full_dataset,
+            split_dir=split_dir,
+            allowed_sequences=get_config_sequences(cfg),
+            limit_samples=limit_samples,
+        )
+    elif split_mode == "order":
+        train_indices = list(range(0, int(len(full_dataset) * train_ratio)))
+        val_indices = list(range(int(len(full_dataset) * train_ratio), len(full_dataset)))
+    else:
+        raise ValueError(f"Unknown split_mode: {split_mode}")
+
+    if len(train_indices) == 0:
+        raise ValueError("Training split is empty. Increase --limit-samples or train_ratio.")
+
+    train_dataset = Subset(full_dataset, train_indices)
+    val_dataset = Subset(full_dataset, val_indices)
+
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(seed)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=detection_collate,
+        num_workers=num_workers,
+        generator=loader_generator,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=detection_collate,
+        num_workers=num_workers,
+    )
+
+    return train_dataset, val_dataset, train_loader, val_loader
+
+
+def build_random_split_indices(full_dataset, train_ratio, seed, limit_samples):
     train_indices = []
     val_indices = []
     remaining_limit = limit_samples
@@ -98,33 +152,134 @@ def build_train_val_dataloaders(
         train_indices.extend(sequence_indices[:train_size])
         val_indices.extend(sequence_indices[train_size:])
 
-    if len(train_indices) == 0:
-        raise ValueError("Training split is empty. Increase --limit-samples or train_ratio.")
+    return train_indices, val_indices
 
-    train_dataset = Subset(full_dataset, train_indices)
-    val_dataset = Subset(full_dataset, val_indices)
 
-    loader_generator = torch.Generator()
-    loader_generator.manual_seed(seed)
+def split_line_to_sequence_and_frame_names(line):
+    line = line.strip()
+    if line == "" or line.startswith("#"):
+        return None
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=detection_collate,
-        num_workers=num_workers,
-        generator=loader_generator,
+    parts = [part.strip() for part in line.split(",")]
+    if len(parts) < 2:
+        raise ValueError(f"Invalid split line: {line!r}")
+
+    sequence = int(parts[0])
+    frame_token = os.path.splitext(parts[1])[0]
+    frame_name = frame_token.split("_")[0]
+    if frame_name == "":
+        raise ValueError(f"Invalid split frame token: {line!r}")
+
+    return sequence, [frame_name]
+
+
+def read_split_file(split_path, allowed_sequences):
+    allowed_sequences = set(int(sequence) for sequence in allowed_sequences)
+    split_by_sequence = {sequence: [] for sequence in allowed_sequences}
+
+    with open(split_path, "r") as split_file:
+        for line in split_file:
+            parsed = split_line_to_sequence_and_frame_names(line)
+            if parsed is None:
+                continue
+
+            sequence, frame_names = parsed
+            if sequence not in allowed_sequences:
+                continue
+
+            split_by_sequence.setdefault(sequence, []).append(frame_names)
+
+    return split_by_sequence
+
+
+def build_sequence_index_lookup(full_dataset):
+    lookup = {}
+    ranges = full_dataset.get_sequence_ranges()
+
+    for dataset, sequence_range in zip(full_dataset.sequence_datasets, ranges):
+        sequence = int(sequence_range["sequence"])
+        start = sequence_range["start"]
+        frame_name_to_local_idx = {
+            frame_name: local_idx
+            for local_idx, frame_name in enumerate(dataset.radar_dataset.frame_names)
+        }
+        lookup[sequence] = {
+            "start": start,
+            "frame_name_to_local_idx": frame_name_to_local_idx,
+        }
+
+    return lookup
+
+
+def split_entries_to_indices(split_by_sequence, sequence_lookup, split_name):
+    indices = []
+    seen = set()
+    missing = []
+
+    for sequence, frame_name_candidates_list in split_by_sequence.items():
+        if sequence not in sequence_lookup:
+            continue
+
+        start = sequence_lookup[sequence]["start"]
+        frame_name_to_local_idx = sequence_lookup[sequence]["frame_name_to_local_idx"]
+
+        for frame_name_candidates in frame_name_candidates_list:
+            local_idx = None
+            for frame_name in frame_name_candidates:
+                local_idx = frame_name_to_local_idx.get(frame_name)
+                if local_idx is not None:
+                    break
+
+            if local_idx is None:
+                missing.append(f"{sequence},{'/'.join(frame_name_candidates)}")
+                continue
+
+            index = start + local_idx
+            if index in seen:
+                continue
+
+            indices.append(index)
+            seen.add(index)
+
+    if len(missing) > 0:
+        preview = ", ".join(missing[:10])
+        print(
+            f"Warning: skipped {len(missing)} samples from {split_name} because they were "
+            f"not found in rad/rae files. First missing entries: {preview}"
+        )
+
+    return indices
+
+
+def build_file_split_indices(full_dataset, split_dir, allowed_sequences, limit_samples):
+    train_split_path = os.path.join(split_dir, "train.txt")
+    val_split_path = os.path.join(split_dir, "test.txt")
+
+    if not os.path.exists(train_split_path):
+        raise FileNotFoundError(f"Training split file not found: {train_split_path}")
+    if not os.path.exists(val_split_path):
+        raise FileNotFoundError(f"Validation split file not found: {val_split_path}")
+
+    sequence_lookup = build_sequence_index_lookup(full_dataset)
+    train_by_sequence = read_split_file(train_split_path, allowed_sequences)
+    val_by_sequence = read_split_file(val_split_path, allowed_sequences)
+
+    train_indices = split_entries_to_indices(
+        split_by_sequence=train_by_sequence,
+        sequence_lookup=sequence_lookup,
+        split_name="train.txt",
+    )
+    val_indices = split_entries_to_indices(
+        split_by_sequence=val_by_sequence,
+        sequence_lookup=sequence_lookup,
+        split_name="test.txt",
     )
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=detection_collate,
-        num_workers=num_workers,
-    )
+    if limit_samples is not None:
+        train_indices = train_indices[:limit_samples]
+        val_indices = val_indices[:limit_samples]
 
-    return train_dataset, val_dataset, train_loader, val_loader
+    return train_indices, val_indices
 
 
 def prepare_model_inputs(batch, device):

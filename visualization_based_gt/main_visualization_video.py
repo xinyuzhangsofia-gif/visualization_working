@@ -1,3 +1,5 @@
+import path_setup
+
 from zxy_config import DataConfig
 from zxy_label_utils import *
 from zxy_data_path import *

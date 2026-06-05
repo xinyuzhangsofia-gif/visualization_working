@@ -6,48 +6,26 @@ import numpy as np
 import torch
 from matplotlib.patches import Rectangle
 
-from dummy_dataloader import *
-from dummy_dataset import (
-    KRadarMultiSequenceGTDetectionDataset,
-    class_to_idx_from_class_names,
-    detection_collate,
-    fallback_class_names_for_num_classes,
-    normalize_class_names,
-    normalize_class_to_idx,
+from dummy_dataloader import (
+    build_train_val_dataloaders,
+    get_config_sequences,
+    prepare_model_inputs,
 )
-from dummy_module import MVRSS3DModel
-from utils_dummy.checkpoints import get_num_classes_from_checkpoint
+from dummy_dataset import (
+    CLASS_NAMES,
+    CLASS_TO_IDX,
+    detection_collate,
+)
+from dummy_module import (
+    MVRSS3DModel,
+    MVRSS3DModelDeform,
+    MVRSS3DModelDeformDepthwiseSeparable,
+)
+from dummy_module_multiscale import MVRSS3DModel2
 from zxy_config import DataConfig
 
 
-CLASS_NAMES = {
-    0: "Sedan",
-    1: "Bus or Truck",
-    2: "Bicycle",
-    3: "Motorcycle",
-    4: "Pedestrian",
-    5: "Pedestrian Group",
-}
-NUM_CLASSES = len(CLASS_NAMES)
-MAX_DETECTIONS = 20
-
-
-def get_checkpoint_class_info(checkpoint, num_boxes):
-    num_classes = get_num_classes_from_checkpoint(
-        checkpoint=checkpoint,
-        num_boxes=num_boxes
-    )
-    config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
-
-    class_names = normalize_class_names(config.get("class_names"))
-    if class_names is None:
-        class_names = fallback_class_names_for_num_classes(num_classes)
-
-    class_to_idx = normalize_class_to_idx(config.get("class_to_idx"))
-    if class_to_idx is None:
-        class_to_idx = class_to_idx_from_class_names(class_names)
-
-    return num_classes, class_names, class_to_idx
+NUM_CLASSES = 2
 
 
 def parse_args():
@@ -55,20 +33,22 @@ def parse_args():
         description="Visualize ground-truth and predicted boxes on RA maps."
     )
     parser.add_argument("--checkpoint-path", 
-                        default="/home/local/xinyu/MVRSS/mvrss/checkpoints/mvrss_detection/\
-                            seq1-11_20260522_101532_180331/best_epoch_011_20260522_121726_mAP_0p0000.pth")
+                        default="checkpoints/mvrss_detection/seq1-11_20260531_233835_389707/global_best_epoch_047_20260601_041256_mAP_0p0643.pth")
     parser.add_argument("--sequence", type=int, default=None)
     parser.add_argument("--start-file-idx", type=int, default=0)
-    parser.add_argument("--frame-step", type=int, default=100)
-    parser.add_argument("--max-frames",type=int,default=0)
-    parser.add_argument("--score-thresh", type=float, default=0.2)
-    parser.add_argument("--save-images", action="store_true")
-    parser.add_argument("--save-dir", default="ra_vis")
+    parser.add_argument("--frame-step", type=int, default=5)
+    parser.add_argument("--max-frames", type=int, default=0)
+    parser.add_argument("--score-thresh", type=float, default=0.0) #0.2
+    parser.add_argument("--num-boxes", type=int, default=64)
+    parser.add_argument("--model-type", default="model3", choices=["model1", "model2", "model3", "model4", "model5"])
+    parser.add_argument("--save-images", action="store_true", help="Save visualizations to disk.")
+    parser.add_argument("--no-display", action="store_true", help="Do not display images to the screen (useful for background saving).")
+    parser.add_argument("--save-dir", default="./ra_vis")
     return parser.parse_args()
 
 
-def build_model(device, num_boxes=64, num_classes=NUM_CLASSES):
-    model = MVRSS3DModel(
+def build_model(device, num_boxes, num_classes=NUM_CLASSES, model_type="model1"):
+    model_kwargs = dict(
         d_in=64,
         e_in=37,
         num_boxes=num_boxes,
@@ -77,9 +57,37 @@ def build_model(device, num_boxes=64, num_classes=NUM_CLASSES):
         feature_channels=64,
         fusion_hidden_channels=64,
         decoder_hidden_channels=128,
-        pooled_size=(8, 8),
-    ).to(device)
-    return model
+    )
+
+    if model_type == "model1":
+        model = MVRSS3DModel(
+            **model_kwargs,
+            pooled_size=(16, 16),
+        )
+    elif model_type == "model2":
+        model = MVRSS3DModel2(
+            **model_kwargs,
+            pooled_size=(8, 8),
+        )
+    elif model_type == "model3":
+        model = MVRSS3DModelDeform(
+            **model_kwargs,
+            pooled_size=(16, 16),
+        )
+    # elif model_type == "model4":
+    #     model = MVRSS3DModelDeform(
+    #         **model_kwargs,
+    #         pooled_size=(4, 4),
+    #     )
+    # elif model_type == "model5":
+    #     model = MVRSS3DModelDeformDepthwiseSeparable(
+    #         **model_kwargs,
+    #         pooled_size=(8, 8),
+    #     )
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+
+    return model.to(device)
 
 def load_checkpoint(model, checkpoint_path, device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -89,16 +97,6 @@ def load_checkpoint(model, checkpoint_path, device):
         model.load_state_dict(checkpoint)
     model.eval()
     return model
-
-
-def build_dataset(cfg):
-    sequence_datasets = [
-        build_detection_dataset_for_sequence(cfg, sequence)
-        for sequence in get_config_sequences(cfg)
-    ]
-    return KRadarMultiSequenceGTDetectionDataset(
-        sequence_datasets=sequence_datasets
-    )
 
 
 def make_ra_map(rae):
@@ -117,22 +115,30 @@ def normalized_boxes_to_raw_rae(boxes, rae_shape):
 
     r_size, a_size, e_size = rae_shape
     raw = boxes.clone()
+    
+    # Un-normalize center coordinates
     raw[:, 0] = raw[:, 0] * r_size
     raw[:, 1] = raw[:, 1] * a_size
     raw[:, 2] = raw[:, 2] * e_size
+    
+    # Un-normalize widths
     raw[:, 3] = raw[:, 3] * r_size
     raw[:, 4] = raw[:, 4] * a_size
     raw[:, 5] = raw[:, 5] * e_size
+    
+    # Un-normalize angle (mapped back from [0,1] to [-pi, pi])
+    raw[:, 6] = (raw[:, 6] * 2.0 * np.pi) - np.pi
+    
     return raw
 
 
-def filter_predictions(outputs, rae_shape, score_thresh, max_detections, num_classes):
+def filter_predictions(outputs, rae_shape, score_thresh, max_detections):
     pred_boxes_norm = outputs["box_pred"].squeeze(0).sigmoid()
     pred_logits = outputs["cls_pred"].squeeze(0)
     pred_probs = pred_logits.softmax(dim=-1)
 
-    foreground_probs = pred_probs[:, :num_classes]
-    background_probs = pred_probs[:, num_classes]
+    foreground_probs = pred_probs[:, :NUM_CLASSES]
+    background_probs = pred_probs[:, NUM_CLASSES]
     pred_scores, pred_labels = foreground_probs.max(dim=-1)
 
     keep = (pred_scores > score_thresh) & (pred_scores > background_probs)
@@ -196,8 +202,7 @@ def get_frame_prediction(
         file_idx,
         device,
         score_thresh,
-        max_detections,
-        num_classes
+        max_detections
     ):
     item = dataset[file_idx]
     batch = detection_collate([item])
@@ -211,7 +216,6 @@ def get_frame_prediction(
         rae_shape=rae_shape,
         score_thresh=score_thresh,
         max_detections=max_detections,
-        num_classes=num_classes,
     )
 
     return {
@@ -282,24 +286,19 @@ def main():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    num_classes, class_names, class_to_idx = get_checkpoint_class_info(
-        checkpoint=checkpoint,
-        num_boxes=64
-    )
     checkpoint_config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
     train_ratio = checkpoint_config.get("train_ratio", 0.7)
     seed = checkpoint_config.get("seed", 42)
-    print(f"Visualization classes: {class_names}")
+    print(f"Visualization classes: {CLASS_NAMES}")
 
-    #dataset = build_dataset(cfg)
-    train_dataset, val_dataset, train_loader, val_loader = build_train_val_dataloaders(
+    _, val_dataset, _, _ = build_train_val_dataloaders(
                                         cfg=cfg,
                                         batch_size=1,
                                         train_ratio=train_ratio,
                                         seed=seed,
                                         num_workers=0,
                                         limit_samples=None,
-                                        class_to_idx=class_to_idx,
+                                        class_to_idx=CLASS_TO_IDX,
                                         ignore_unmapped_classes=True,
                                     )
     dataset = val_dataset
@@ -309,7 +308,11 @@ def main():
         f"device={device}"
     )
 
-    model = build_model(device, num_classes=num_classes)
+    model = build_model(
+        device=device,
+        num_boxes=args.num_boxes,
+        model_type=args.model_type
+    )
     model = load_checkpoint(model, checkpoint_path, device)
 
     if args.save_images:
@@ -334,12 +337,11 @@ def main():
             file_idx=val_idx,
             device=device,
             score_thresh=args.score_thresh,
-            max_detections=MAX_DETECTIONS,
-            num_classes=num_classes,
+            max_detections=args.num_boxes,
         )
 
         fig, ax = plt.subplots(figsize=(10, 8))
-        show_frame(ax, frame_data, class_names)
+        show_frame(ax, frame_data, CLASS_NAMES)
         fig.tight_layout()
 
         item = frame_data["item"]
@@ -360,8 +362,9 @@ def main():
             fig.savefig(output_path, dpi=160)
             print(f"saved={output_path}")
 
-        print("Close the matplotlib window to continue.")
-        plt.show()
+        if not args.no_display:
+            print("Close the matplotlib window to continue.")
+            plt.show()
 
         plt.close(fig)
         rendered_count += 1

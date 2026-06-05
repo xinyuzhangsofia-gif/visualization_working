@@ -1,4 +1,5 @@
 import os
+import path_setup
 
 os.environ.pop("QT_QPA_PLATFORM", None)
 os.environ.pop("QT_PLUGIN_PATH", None)
@@ -389,5 +390,4 @@ if __name__ == "__main__":
         cv2.imshow("camera",image_with_pcd)
         cv2.waitKey(0)
         cv2.destroyAllWindows()
-
 

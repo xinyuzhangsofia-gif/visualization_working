@@ -2,55 +2,97 @@ import argparse
 import os
 import re
 import torch
+import tqdm
 from dummy_dataloader import build_train_val_dataloaders, prepare_model_inputs
 from dummy_dataset import (
-    class_to_idx_from_class_names,
-    fallback_class_names_for_num_classes,
-    normalize_class_names,
-    normalize_class_to_idx,
+    CLASS_NAMES,
+    CLASS_TO_IDX,
 )
-from dummy_visualize import build_model, load_checkpoint, select_device
-from utils_dummy.checkpoints import get_num_classes_from_checkpoint
+from dummy_visualize import build_model, load_checkpoint
 from zxy_config import DataConfig
-import tqdm
+
+
+NUM_CLASSES = 2
+
+
+def parse_gpu_ids(gpu_ids_text):
+    return [
+        int(gpu_id.strip())
+        for gpu_id in gpu_ids_text.split(",")
+        if gpu_id.strip() != ""
+    ]
+
+
+def parse_cuda_choice(cuda_text, fallback_gpu_ids_text):
+    if cuda_text is None:
+        return parse_gpu_ids(fallback_gpu_ids_text)
+
+    cuda_text = cuda_text.strip().lower()
+    if cuda_text in ("", "cpu", "none"):
+        return []
+
+    gpu_ids = []
+    for cuda_part in cuda_text.split(","):
+        cuda_part = cuda_part.strip().lower()
+        if cuda_part.startswith("cuda:"):
+            cuda_part = cuda_part.removeprefix("cuda:")
+        if cuda_part.startswith("gpu"):
+            gpu_number = int(cuda_part.removeprefix("gpu"))
+            if gpu_number <= 0:
+                raise ValueError(f"GPU names start from gpu1, got {cuda_part!r}")
+            gpu_ids.append(gpu_number - 1)
+        else:
+            gpu_ids.append(int(cuda_part))
+
+    return gpu_ids
+
+
+def select_evaluation_device(cuda_text, gpu_ids_text):
+    gpu_ids = parse_cuda_choice(cuda_text, gpu_ids_text)
+    if torch.cuda.is_available() and len(gpu_ids) > 0:
+        available_gpu_count = torch.cuda.device_count()
+        unavailable_gpu_ids = [
+            gpu_id for gpu_id in gpu_ids
+            if gpu_id < 0 or gpu_id >= available_gpu_count
+        ]
+        if len(unavailable_gpu_ids) > 0:
+            raise ValueError(
+                f"Requested GPU ids {unavailable_gpu_ids}, "
+                f"but only {available_gpu_count} CUDA device(s) are available."
+            )
+        if len(gpu_ids) > 1:
+            print(f"Evaluation uses one GPU only; using cuda:{gpu_ids[0]} from {gpu_ids}.")
+        return torch.device(f"cuda:{gpu_ids[0]}")
+
+    return torch.device("cpu")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate dummy MVRSS checkpoints.")
     parser.add_argument("--checkpoint-root", default=
-                        "/home/local/xinyu/MVRSS/mvrss/checkpoints/mvrss_detection/seq11_20260520_105936_148715")
-    parser.add_argument("--epoch-step", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=4)
+                        "checkpoints/mvrss_detection/seq1-11_20260531_233835_389707/global_best_epoch_047_20260601_041256_mAP_0p0643.pth")
+    parser.add_argument("--epoch-step", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=48)
     parser.add_argument("--train-ratio", type=float, default=0.7)
+    parser.add_argument("--split-mode", default="file", choices=["random", "file"])
+    parser.add_argument("--split-dir", default="split")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--limit-samples", type=int, default=None)
-    parser.add_argument("--score-thresh", type=float, default=0.2)
+    parser.add_argument("--score-thresh", type=float, default=0.5)
     parser.add_argument("--eval-iou-thresh", type=float, default=0.1)
     parser.add_argument("--num-boxes", type=int, default=64)
+    parser.add_argument("--model-type", default="model3", choices=["model1", "model2", "model3", "model4", "model5"])
+    parser.add_argument("--gpu-ids", default="1,2" )
+    parser.add_argument(
+        "--cuda",
+        default=None,
+        help="Choose device: gpu1, gpu2, cuda:0, cuda:1, 0, 1, or cpu."
+    )
     return parser.parse_args()
 
 
-def get_checkpoint_class_info(checkpoint, num_boxes):
-    num_classes = get_num_classes_from_checkpoint(
-        checkpoint=checkpoint,
-        num_boxes=num_boxes
-    )
-    config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
-
-    class_names = normalize_class_names(config.get("class_names"))
-    if class_names is None:
-        class_names = fallback_class_names_for_num_classes(num_classes)
-
-    class_to_idx = normalize_class_to_idx(config.get("class_to_idx"))
-    if class_to_idx is None:
-        class_to_idx = class_to_idx_from_class_names(class_names)
-
-    return num_classes, class_names, class_to_idx
-
-
 def boxes_3d_to_ra_xyxy(boxes):
-
     r = boxes[:, 0]
     a = boxes[:, 1]
     r_w = boxes[:, 3]
@@ -65,7 +107,6 @@ def boxes_3d_to_ra_xyxy(boxes):
 
 
 def box_iou_2d(boxes1, boxes2):
-
     if boxes1.numel() == 0 or boxes2.numel() == 0:
         return torch.zeros(
             (boxes1.shape[0], boxes2.shape[0]),
@@ -129,23 +170,23 @@ def compute_map(predictions_by_class, gt_by_class, num_classes, iou_thresh):
         num_gt = sum(data["boxes"].shape[0] for data in gt_for_class.values())
 
         matched_gt = {
-            image_id: torch.zeros(data["boxes"].shape[0], dtype=torch.bool)
-            for image_id, data in gt_for_class.items()
+            sequence_id: torch.zeros(data["boxes"].shape[0], dtype=torch.bool)
+            for sequence_id, data in gt_for_class.items()
         }
 
         tp_flags = []
         fp_flags = []
 
         for pred in predictions:
-            image_id = pred["image_id"]
+            sequence_id = pred["sequence_id"]
             pred_box = pred["box"]
 
-            if image_id not in gt_for_class or gt_for_class[image_id]["boxes"].shape[0] == 0:
+            if sequence_id not in gt_for_class or gt_for_class[sequence_id]["boxes"].shape[0] == 0:
                 tp_flags.append(0)
                 fp_flags.append(1)
                 continue
 
-            gt_boxes = gt_for_class[image_id]["boxes"].to(pred_box.device)
+            gt_boxes = gt_for_class[sequence_id]["boxes"].to(pred_box.device)
             ious = box_iou_2d(
                 boxes_3d_to_ra_xyxy(pred_box.unsqueeze(0)),
                 boxes_3d_to_ra_xyxy(gt_boxes)
@@ -154,10 +195,10 @@ def compute_map(predictions_by_class, gt_by_class, num_classes, iou_thresh):
             best_iou, best_gt_idx = ious.max(dim=0)
             best_gt_idx = int(best_gt_idx.item())
 
-            if best_iou.item() >= iou_thresh and not matched_gt[image_id][best_gt_idx]:
+            if best_iou.item() >= iou_thresh and not matched_gt[sequence_id][best_gt_idx]:
                 tp_flags.append(1)
                 fp_flags.append(0)
-                matched_gt[image_id][best_gt_idx] = True
+                matched_gt[sequence_id][best_gt_idx] = True
             else:
                 tp_flags.append(0)
                 fp_flags.append(1)
@@ -185,9 +226,9 @@ def evaluate_precision_recall(
         device,
         num_classes,
         prepare_model_inputs,
-        score_thresh=0.5,
+        score_thresh=0.2, 
         iou_thresh=0.5,
-        max_detections=20
+        max_detections=64
     ):
     model.eval()
 
@@ -196,9 +237,10 @@ def evaluate_precision_recall(
     total_fn = 0
     total_iou = 0.0
     total_iou_count = 0
+    
     predictions_by_class = {class_id: [] for class_id in range(num_classes)}
     gt_by_class = {class_id: {} for class_id in range(num_classes)}
-    image_counter = 0
+    sequence_counter = 0
 
     for batch in tqdm.tqdm(dataloader, desc="Evaluation", ncols=120, leave=False):
         rad, rae = prepare_model_inputs(batch, device)
@@ -210,91 +252,92 @@ def evaluate_precision_recall(
 
         foreground_probs = pred_probs[:, :, :num_classes]
         background_probs = pred_probs[:, :, num_classes]
-
         pred_scores, pred_labels = foreground_probs.max(dim=-1)
 
         batch_size = pred_boxes.shape[0]
 
         for b in range(batch_size):
-            if "image_id" in batch:
-                image_id = batch["image_id"][b]
+            # 1. Setup ID
+            if "sequence_id" in batch:
+                sequence_id = batch["sequence_id"][b]
             elif "file_idx" in batch:
-                image_id = batch["file_idx"][b]
+                sequence_id = batch["file_idx"][b]
             else:
-                image_id = image_counter
-                image_counter += 1
+                sequence_id = sequence_counter
+                sequence_counter += 1
 
             scores_b = pred_scores[b]
             labels_b = pred_labels[b]
             boxes_b = pred_boxes[b]
             background_scores_b = background_probs[b]
 
-            keep = (scores_b > score_thresh) & (scores_b > background_scores_b)
-            #keep = (scores_b > score_thresh)
-            pred_boxes_keep = boxes_b[keep]
-            pred_labels_keep = labels_b[keep]
-            pred_scores_keep = scores_b[keep]
-
-            if pred_scores_keep.shape[0] > max_detections:
-                topk_scores, topk_indices = pred_scores_keep.topk(max_detections)
-
-                pred_boxes_keep = pred_boxes_keep[topk_indices]
-                pred_labels_keep = pred_labels_keep[topk_indices]
-                pred_scores_keep = topk_scores
-
+            # 2. Extract Ground Truth
             gt_boxes_all = batch["gt_boxes"][b].to(device)
             gt_labels_all = batch["gt_labels"][b].to(device)
             valid_gt = gt_labels_all < num_classes
             gt_boxes = gt_boxes_all[valid_gt]
             gt_labels = gt_labels_all[valid_gt]
 
+            # Register GT for AP calculation
             for class_id in range(num_classes):
                 class_gt_boxes = gt_boxes[gt_labels == class_id].detach().cpu()
-                gt_by_class[class_id][image_id] = {"boxes": class_gt_boxes}
+                gt_by_class[class_id][sequence_id] = {"boxes": class_gt_boxes}
 
-            for pred_box, pred_label, pred_score in zip(
-                    pred_boxes_keep,
-                    pred_labels_keep,
-                    pred_scores_keep
-                ):
-                class_id = int(pred_label.item())
-                predictions_by_class[class_id].append({
-                    "image_id": image_id,
+            # 3. Filter for mAP Calculation (NO SCORE THRESHOLD HERE)
+            map_keep = scores_b > background_scores_b
+            map_boxes = boxes_b[map_keep]
+            map_labels = labels_b[map_keep]
+            map_scores = scores_b[map_keep]
+
+            # Top-K for mAP
+            if map_scores.shape[0] > max_detections:
+                topk_scores, topk_indices = map_scores.topk(max_detections)
+                map_boxes = map_boxes[topk_indices]
+                map_labels = map_labels[topk_indices]
+                map_scores = topk_scores
+
+            # Populate predictions for rigorous mAP calculation
+            for pred_box, pred_label, pred_score in zip(map_boxes, map_labels, map_scores):
+                predictions_by_class[int(pred_label.item())].append({
+                    "sequence_id": sequence_id,
                     "score": float(pred_score.item()),
                     "box": pred_box.detach().cpu(),
                 })
 
-            if pred_boxes_keep.shape[0] == 0:
+            # 4. Filter for Fixed-Point Metrics (TP/FP/FN/F1 at specific threshold)
+            point_keep = (map_scores > score_thresh)
+            point_boxes = map_boxes[point_keep]
+            point_labels = map_labels[point_keep]
+            point_scores = map_scores[point_keep]
+
+            if point_boxes.shape[0] == 0:
                 total_fn += gt_boxes.shape[0]
                 continue
 
             if gt_boxes.shape[0] == 0:
-                total_fp += pred_boxes_keep.shape[0]
+                total_fp += point_boxes.shape[0]
                 continue
 
-            pred_ra_boxes = boxes_3d_to_ra_xyxy(pred_boxes_keep)
+            # Calculate strict-point TP/FP
+            pred_ra_boxes = boxes_3d_to_ra_xyxy(point_boxes)
             gt_ra_boxes = boxes_3d_to_ra_xyxy(gt_boxes)
-
             ious = box_iou_2d(pred_ra_boxes, gt_ra_boxes)
 
             matched_gt = set()
-            order = pred_scores_keep.argsort(descending=True)
+            order = point_scores.argsort(descending=True)
 
             for pred_idx_tensor in order:
                 pred_idx = pred_idx_tensor.item()
-
                 best_iou = -1.0
                 best_gt_idx = -1
 
                 for gt_idx in range(gt_boxes.shape[0]):
                     if gt_idx in matched_gt:
                         continue
-
-                    if pred_labels_keep[pred_idx].item() != gt_labels[gt_idx].item():
+                    if point_labels[pred_idx].item() != gt_labels[gt_idx].item():
                         continue
 
                     iou_value = ious[pred_idx, gt_idx].item()
-
                     if iou_value > best_iou:
                         best_iou = iou_value
                         best_gt_idx = gt_idx
@@ -309,17 +352,17 @@ def evaluate_precision_recall(
 
             total_fn += gt_boxes.shape[0] - len(matched_gt)
 
+    # Calculate final metrics
     precision = total_tp / (total_tp + total_fp + 1e-6)
     recall = total_tp / (total_tp + total_fn + 1e-6)
     mean_iou = total_iou / max(total_iou_count, 1)
+    
     mean_ap, ap_per_class = compute_map(
         predictions_by_class=predictions_by_class,
         gt_by_class=gt_by_class,
         num_classes=num_classes,
         iou_thresh=iou_thresh
     )
-
-    model.train()
 
     return {
         "precision": precision,
@@ -394,24 +437,32 @@ def find_epoch_checkpoints(checkpoint_root, epoch_step):
             epoch = checkpoint.get("epoch", 0) if isinstance(checkpoint, dict) else 0
         return [(epoch, checkpoint_root)]
 
-    checkpoint_paths = []
+    checkpoint_by_epoch = {}
     for filename in os.listdir(checkpoint_root):
         if not filename.endswith(".pth"):
             continue
-        if not (filename.startswith("epoch_") or filename.startswith("candidate_epoch_")):
+
+        is_global_best = filename.startswith("global_best_epoch_")
+        is_candidate = filename.startswith("candidate_epoch_")
+        is_epoch = filename.startswith("epoch_")
+        if not (is_global_best or is_candidate or is_epoch):
             continue
 
         checkpoint_path = os.path.join(checkpoint_root, filename)
         epoch = checkpoint_epoch(checkpoint_path)
-        if epoch is None or epoch % epoch_step != 0:
+        if epoch is None:
             continue
 
-        checkpoint_paths.append((epoch, checkpoint_path))
+        if not is_global_best and epoch % epoch_step != 0:
+            continue
 
+        existing = checkpoint_by_epoch.get(epoch)
+        if existing is None or is_global_best:
+            checkpoint_by_epoch[epoch] = (epoch, checkpoint_path)
+
+    checkpoint_paths = list(checkpoint_by_epoch.values())
     checkpoint_paths.sort(key=lambda item: item[0])
     return checkpoint_paths
-
-
 
 
 def class_ap_from_name(ap_per_class, class_names, target_name):
@@ -422,7 +473,7 @@ def class_ap_from_name(ap_per_class, class_names, target_name):
 
 
 def metrics_for_graph(metrics, class_names):
-    precision = metrics["precision"]
+    precision = metrics["precision"] 
     recall = metrics["recall"]
     f1 = 2 * precision * recall / (precision + recall + 1e-6)
     ap_per_class = metrics["ap_per_class"]
@@ -430,8 +481,6 @@ def metrics_for_graph(metrics, class_names):
         "mAP": metrics["mAP"],
         "bus_or_truck_ap": class_ap_from_name(ap_per_class, class_names, "Bus or Truck"),
         "sedan_ap": class_ap_from_name(ap_per_class, class_names, "Sedan"),
-        "two_wheeler_ap": class_ap_from_name(ap_per_class, class_names, "Two-wheeler"),
-        "pedestrian_ap": class_ap_from_name(ap_per_class, class_names, "Pedestrian"),
         "iou": metrics["mean_iou"],
         "TP": metrics["tp"],
         "FP": metrics["fp"],
@@ -446,8 +495,6 @@ def print_evaluation_result(epoch, graph_metrics):
         f"mAP={graph_metrics['mAP']:.4f}",
         f"bus_or_truck_ap={graph_metrics['bus_or_truck_ap']:.4f}",
         f"sedan_ap={graph_metrics['sedan_ap']:.4f}",
-        f"two_wheeler_ap={graph_metrics['two_wheeler_ap']:.4f}",
-        f"pedestrian_ap={graph_metrics['pedestrian_ap']:.4f}",
         f"iou={graph_metrics['iou']:.4f}",
         f"TP={graph_metrics['TP']}",
         f"FP={graph_metrics['FP']}",
@@ -464,8 +511,7 @@ def print_results_table(results):
     print("\n" + "="*110)
     print(
         f"{'Epoch':<8} {'mAP':<10} {'bus_or_truck_ap':<16} {'sedan_ap':<10} "
-        f"{'two_wheeler_ap':<16} {'pedestrian_ap':<16} {'iou':<10} "
-        f"{'f1':<10} {'TP':<8} {'FP':<8}"
+        f"{'iou':<10} {'f1':<10} {'TP':<8} {'FP':<8}"
     )
     print("="*110)
     
@@ -475,8 +521,6 @@ def print_results_table(results):
             f"{result['mAP']:<10.4f} "
             f"{result['bus_or_truck_ap']:<16.4f} "
             f"{result['sedan_ap']:<10.4f} "
-            f"{result['two_wheeler_ap']:<16.4f} "
-            f"{result['pedestrian_ap']:<16.4f} "
             f"{result['iou']:<10.4f} "
             f"{result['f1']:<10.4f} "
             f"{result['TP']:<8} "
@@ -487,21 +531,15 @@ def print_results_table(results):
 
 
 def main():
-
-
     args = parse_args()
-    device = select_device()
+    device = select_evaluation_device(args.cuda, args.gpu_ids)
     cfg = DataConfig()
     checkpoint_paths = find_epoch_checkpoints(args.checkpoint_root, args.epoch_step)
     if len(checkpoint_paths) == 0:
         raise ValueError(f"No epoch checkpoints found in {args.checkpoint_root}")
 
-    first_checkpoint = torch.load(checkpoint_paths[0][1], map_location=device)
-    num_classes, class_names, class_to_idx = get_checkpoint_class_info(
-        checkpoint=first_checkpoint,
-        num_boxes=args.num_boxes
-    )
-    print(f"Evaluation classes: {class_names}")
+    print(f"Evaluation classes: {CLASS_NAMES}")
+    print(f"Using evaluation device: {device}")
 
     _, validation_dataset, _, validation_loader = build_train_val_dataloaders(
         cfg=cfg,
@@ -510,14 +548,21 @@ def main():
         seed=args.seed,
         num_workers=args.num_workers,
         limit_samples=args.limit_samples,
-        class_to_idx=class_to_idx,
+        class_to_idx=CLASS_TO_IDX,
         ignore_unmapped_classes=True,
+        split_mode=args.split_mode,
+        split_dir=args.split_dir,
     )
 
     if len(validation_dataset) == 0:
         raise ValueError("Validation split is empty. Adjust --train-ratio or --limit-samples.")
 
-    model = build_model(device=device,num_boxes=args.num_boxes,num_classes=num_classes)
+    model = build_model(
+        device=device,
+        num_boxes=args.num_boxes,
+        num_classes=NUM_CLASSES,
+        model_type=args.model_type
+    )
 
     def evaluate_checkpoint(checkpoint_path):
         load_checkpoint(
@@ -525,15 +570,15 @@ def main():
             checkpoint_path=checkpoint_path,
             device=device
         )
-        metrics=evaluate_precision_recall(
+        metrics = evaluate_precision_recall(
             model=model,
             dataloader=validation_loader,
             device=device,
-            num_classes=num_classes,
+            num_classes=NUM_CLASSES,
             prepare_model_inputs=prepare_model_inputs,
             score_thresh=args.score_thresh,
             iou_thresh=args.eval_iou_thresh,
-            max_detections=min(args.num_boxes, 20)
+            max_detections=args.num_boxes
         )
         return metrics
 
@@ -541,7 +586,7 @@ def main():
     print(f"Evaluating {len(checkpoint_paths)} checkpoints from {args.checkpoint_root}")
     for epoch, checkpoint_path in tqdm.tqdm(checkpoint_paths, desc="Checkpoints", ncols=120):
         metrics = evaluate_checkpoint(checkpoint_path)
-        graph_metrics = metrics_for_graph(metrics, class_names)
+        graph_metrics = metrics_for_graph(metrics, CLASS_NAMES)
         graph_metrics["epoch"] = epoch
         results.append(graph_metrics)
         print_evaluation_result(epoch, graph_metrics)

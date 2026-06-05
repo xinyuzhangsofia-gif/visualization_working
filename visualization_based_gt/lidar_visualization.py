@@ -1,4 +1,5 @@
 import os
+import path_setup
 import numpy as np
 import torch
 import time

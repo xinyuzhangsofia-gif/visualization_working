@@ -78,7 +78,6 @@ def get_radar_path(radar_dir,tesseract_idx):
 
 def get_rad_rae_npy_root_dir():
     return "/home/local/xinyu/K-Radar-RAD"
-    # return "/run/user/1000/gvfs/smb-share:server=192.168.189.30,share=elab-share/Datasets/K-Radar-RAD"
 
 
 

@@ -1,4 +1,5 @@
 import os
+import path_setup
 
 os.environ.pop("QT_QPA_PLATFORM", None)
 os.environ.pop("QT_PLUGIN_PATH", None)
